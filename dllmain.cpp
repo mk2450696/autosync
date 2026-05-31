@@ -14,6 +14,9 @@ std::vector<double> frameTimes;
 auto lastPresentTime = std::chrono::high_resolution_clock::now();
 bool hookSuccessful = false;
 
+// The Intel Monitor Pointer
+IDXGIOutput* pActiveOutput = nullptr;
+
 void WriteLog(const char* message) {
     FILE* fp;
     if (fopen_s(&fp, "AutoPacer.log", "a") == 0) {
@@ -29,6 +32,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         hookSuccessful = true;
     }
 
+    // 1. DYNAMIC PACER (The Bouncer)
     auto now = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed = now - lastPresentTime;
 
@@ -52,16 +56,41 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         }
     }
 
+    // 2. CROSS-ADAPTER VBLANK SYNC (The Tear Killer)
+    // If we don't have the Intel monitor yet, find it.
+    if (!pActiveOutput) {
+        IDXGIFactory* pFactory = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&pFactory))) {
+            IDXGIAdapter* pAdapter = nullptr;
+            // Scan all GPUs for an active monitor output (This will find the Intel iGPU)
+            for (UINT i = 0; pFactory->EnumAdapters(i, &pAdapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+                if (pAdapter->EnumOutputs(0, &pActiveOutput) != DXGI_ERROR_NOT_FOUND) {
+                    WriteLog("SUCCESS: Located Active Monitor. VBlank Sync Engaged.");
+                    pAdapter->Release();
+                    break;
+                }
+                pAdapter->Release();
+            }
+            pFactory->Release();
+        }
+    }
+
+    // If we found the Intel monitor, force NVIDIA to wait for its invisible refresh cycle
+    if (pActiveOutput) {
+        pActiveOutput->WaitForVBlank();
+    }
+
     lastPresentTime = std::chrono::high_resolution_clock::now();
+    
+    // Release the frame instantly (SyncInterval=0) because we manually handled the sync
     return oPresent(pSwapChain, 0, Flags);
 }
 
 DWORD WINAPI MainThread(LPVOID lpReserved) {
-    // Wait until the game naturally loads DirectX before doing anything
     while (GetModuleHandleA("dxgi.dll") == NULL) {
         Sleep(100);
     }
-    Sleep(2000); // Give the engine an extra 2 seconds to unpack
+    Sleep(2000); 
     
     WriteLog("AutoPacer woke up. DXGI found. Attempting to hook...");
     
@@ -90,15 +119,11 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
             MH_EnableHook(MH_ALL_HOOKS);
             WriteLog("DXGI Hook planted successfully.");
             Beep(1000, 300); 
-        } else {
-            WriteLog("ERROR: Failed to plant DXGI Hook.");
         }
 
         pSwapChain->Release();
         pDevice->Release();
         pContext->Release();
-    } else {
-        WriteLog("ERROR: Failed to create dummy DirectX device.");
     }
     DestroyWindow(hWnd);
     UnregisterClassA("DummyClass", wc.hInstance);
