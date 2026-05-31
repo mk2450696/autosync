@@ -4,6 +4,7 @@
 #include <chrono>
 #include <vector>
 #include <numeric>
+#include <fstream>
 #include <MinHook.h>
 
 typedef HRESULT(__stdcall* Present_t)(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags);
@@ -11,8 +12,24 @@ Present_t oPresent = nullptr;
 
 std::vector<double> frameTimes;
 auto lastPresentTime = std::chrono::high_resolution_clock::now();
+bool hookSuccessful = false;
+
+// Custom Log Writer
+void WriteLog(const char* message) {
+    std::ofstream logFile("AutoPacer.log", std::ios_base::app);
+    if (logFile.is_open()) {
+        logFile << message << "\n";
+        logFile.close();
+    }
+}
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
+    if (!hookSuccessful) {
+        WriteLog("SUCCESS: First Frame Intercepted! AutoPacer is actively pacing frames.");
+        Beep(750, 300); // Beep out loud when the first frame is grabbed
+        hookSuccessful = true;
+    }
+
     auto now = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed = now - lastPresentTime;
 
@@ -27,7 +44,6 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         double avgFrameTime = std::accumulate(frameTimes.begin(), frameTimes.end(), 0.0) / frameTimes.size();
         double targetTime = avgFrameTime - 0.2; // 0.2ms breathing buffer
 
-        // THE BOUNCER: Stop Micro-Bursts
         if (elapsed.count() < targetTime) {
             while (true) {
                 auto spinNow = std::chrono::high_resolution_clock::now();
@@ -38,12 +54,12 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
 
     lastPresentTime = std::chrono::high_resolution_clock::now();
-    
-    // Force SyncInterval = 0 to keep Intel VRR active
     return oPresent(pSwapChain, 0, Flags);
 }
 
 DWORD WINAPI MainThread(LPVOID lpReserved) {
+    WriteLog("AutoPacer injected into game process. Attempting to hook DXGI...");
+    
     WNDCLASSEXA wc = { sizeof(WNDCLASSEXA), CS_CLASSDC, DefWindowProcA, 0L, 0L, GetModuleHandleA(NULL), NULL, NULL, NULL, NULL, "DummyClass", NULL };
     RegisterClassExA(&wc);
     HWND hWnd = CreateWindowA("DummyClass", "", WS_OVERLAPPEDWINDOW, 100, 100, 100, 100, NULL, NULL, wc.hInstance, NULL);
@@ -65,12 +81,19 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
         void** pVTable = *reinterpret_cast<void***>(pSwapChain);
         
         MH_Initialize();
-        MH_CreateHook(pVTable[8], reinterpret_cast<LPVOID>(&hkPresent), reinterpret_cast<LPVOID*>(&oPresent));
-        MH_EnableHook(MH_ALL_HOOKS);
+        if (MH_CreateHook(pVTable[8], reinterpret_cast<LPVOID>(&hkPresent), reinterpret_cast<LPVOID*>(&oPresent)) == MH_OK) {
+            MH_EnableHook(MH_ALL_HOOKS);
+            WriteLog("DXGI Hook planted successfully.");
+            Beep(1000, 300); // Beep when hook is planted
+        } else {
+            WriteLog("ERROR: Failed to plant DXGI Hook.");
+        }
 
         pSwapChain->Release();
         pDevice->Release();
         pContext->Release();
+    } else {
+        WriteLog("ERROR: Failed to create dummy DirectX device.");
     }
     DestroyWindow(hWnd);
     UnregisterClassA("DummyClass", wc.hInstance);
