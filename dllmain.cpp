@@ -4,7 +4,7 @@
 #include <chrono>
 #include <vector>
 #include <numeric>
-#include "MinHook.h" // Installed via NuGet
+#include <MinHook.h>
 
 #pragma comment(lib, "d3d11.lib")
 
@@ -21,7 +21,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     auto now = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed = now - lastPresentTime;
 
-    // Track the rolling average of the last 10 frames (ignore huge spikes >100ms like loading screens)
+    // Track rolling average of last 10 frames (ignore huge spikes like menus)
     if (elapsed.count() > 0 && elapsed.count() < 100.0) {
         if (frameTimes.size() >= 10) {
             frameTimes.erase(frameTimes.begin());
@@ -52,10 +52,10 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
 // Initialization Thread
 DWORD WINAPI MainThread(LPVOID lpReserved) {
-    // 1. Create a dummy DirectX window to find the hardware swapchain address
-    WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, DefWindowProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, "DummyClass", NULL };
-    RegisterClassEx(&wc);
-    HWND hWnd = CreateWindow("DummyClass", "", WS_OVERLAPPEDWINDOW, 100, 100, 100, 100, NULL, NULL, wc.hInstance, NULL);
+    // 1. Create a dummy DirectX window (Forced ASCII to avoid Unicode compiler errors)
+    WNDCLASSEXA wc = { sizeof(WNDCLASSEXA), CS_CLASSDC, DefWindowProcA, 0L, 0L, GetModuleHandleA(NULL), NULL, NULL, NULL, NULL, "DummyClass", NULL };
+    RegisterClassExA(&wc);
+    HWND hWnd = CreateWindowA("DummyClass", "", WS_OVERLAPPEDWINDOW, 100, 100, 100, 100, NULL, NULL, wc.hInstance, NULL);
 
     DXGI_SWAP_CHAIN_DESC sd = {};
     sd.BufferCount = 1;
@@ -85,7 +85,7 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
         pContext->Release();
     }
     DestroyWindow(hWnd);
-    UnregisterClass("DummyClass", wc.hInstance);
+    UnregisterClassA("DummyClass", wc.hInstance);
     return TRUE;
 }
 
