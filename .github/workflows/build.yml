@@ -6,19 +6,17 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Setup MSVC Compiler
-      uses: ilammy/msvc-dev-cmd@v1
-      
-    - name: Install MinHook Library
+    - name: Install MinHook
       run: vcpkg install minhook:x64-windows
       
-    - name: Compile the DLL
-      shell: cmd
-      run: |
-        cl.exe /O2 /LD /MT /EHsc dllmain.cpp /I "%VCPKG_INSTALLATION_ROOT%\installed\x64-windows\include" /link /LIBPATH:"%VCPKG_INSTALLATION_ROOT%\installed\x64-windows\lib" minhook.lib d3d11.lib dxgi.lib user32.lib /OUT:AutoPacer.dll
-        
+    - name: Configure CMake
+      run: cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -A x64
+      
+    - name: Build DLL
+      run: cmake --build build --config Release
+      
     - name: Upload Finished DLL
       uses: actions/upload-artifact@v4
       with:
         name: AutoPacer-DLL
-        path: AutoPacer.dll
+        path: build/Release/AutoPacer.dll
