@@ -1,19 +1,23 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <deque>
+#include <numeric>
 #include <stdio.h>
 #include <MinHook.h>
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 2
+#endif
 
 typedef HRESULT(__stdcall* Present_t)(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags);
 Present_t oPresent = nullptr;
 
 LARGE_INTEGER g_qpcFreq;
-LARGE_INTEGER g_LastReturnTime = { 0 };
-LARGE_INTEGER g_LastBatchStartTime = { 0 };
-LARGE_INTEGER g_LastPresentTime = { 0 };
+LARGE_INTEGER g_lastPresentTime = { 0 };
+std::deque<double> g_frameDeltas;
+HANDLE g_hTimer = nullptr;
 
-double g_TargetInterval = 6.33; // Default 158 FPS
-int g_FramesInBatch = 0;
 bool g_FirstFrame = true;
 bool g_IsInitialized = false;
 
@@ -27,7 +31,7 @@ void WriteLog(const char* message) {
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
     if (g_FirstFrame) {
-        WriteLog("SUCCESS: Dynamic Batch Pacer Active. VRR is fully tracking.");
+        WriteLog("SUCCESS: Adaptive Smoother (v7) Active. 0% CPU Burn.");
         Beep(750, 150);
         Beep(1000, 150);
         g_FirstFrame = false;
@@ -36,55 +40,51 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
 
-    // 1. BATCH DETECTION (Isolate Real Frames from Fake Frames)
-    // If the gap since we last returned is > 3.0ms, the game engine actually had to render.
-    double gapMs = 0.0;
-    if (g_LastReturnTime.QuadPart != 0) {
-        gapMs = (now.QuadPart - g_LastReturnTime.QuadPart) * 1000.0 / g_qpcFreq.QuadPart;
-    }
-
-    if (gapMs > 3.0 || g_LastBatchStartTime.QuadPart == 0) {
-        if (g_FramesInBatch > 0) {
-            // Calculate exact True FPS of the last batch
-            double batchDurationMs = (now.QuadPart - g_LastBatchStartTime.QuadPart) * 1000.0 / g_qpcFreq.QuadPart;
-            double measuredInterval = batchDurationMs / g_FramesInBatch;
-
-            // Safe VRR Clamps (158 FPS ceiling, 40 FPS floor)
-            if (measuredInterval < 6.33) measuredInterval = 6.33;
-            if (measuredInterval > 25.0) measuredInterval = 25.0;
-
-            // Exponential Moving Average to make VRR buttery smooth
-            g_TargetInterval = (g_TargetInterval * 0.85) + (measuredInterval * 0.15);
+    if (g_lastPresentTime.QuadPart != 0) {
+        double deltaMs = (double)(now.QuadPart - g_lastPresentTime.QuadPart) * 1000.0 / g_qpcFreq.QuadPart;
+        
+        // Ignore massive spikes (loading screens, alt-tabs) so they don't corrupt the math
+        if (deltaMs > 0.0 && deltaMs < 100.0) {
+            g_frameDeltas.push_back(deltaMs);
+            if (g_frameDeltas.size() > 60) {
+                g_frameDeltas.pop_front();
+            }
         }
-        g_LastBatchStartTime = now;
-        g_FramesInBatch = 0;
-    }
 
-    g_FramesInBatch++;
+        if (g_frameDeltas.size() >= 10) {
+            double sum = std::accumulate(g_frameDeltas.begin(), g_frameDeltas.end(), 0.0);
+            double avgDelta = sum / g_frameDeltas.size();
 
-    // 2. THE DYNAMIC METRONOME (Zero Latency Spinlock)
-    long long targetTicks = g_LastPresentTime.QuadPart + (long long)(g_TargetInterval * g_qpcFreq.QuadPart / 1000.0);
+            // THE 25% HEADROOM RULE
+            // Allows FPS to climb freely, but utterly crushes 1000fps Frame Gen micro-bursts.
+            double targetGapMs = avgDelta * 0.75;
 
-    if (now.QuadPart >= targetTicks) {
-        // If we dropped a frame naturally, catch up instantly
-        g_LastPresentTime = now;
-    } else {
-        // Pure hardware spinlock for nanosecond precision (NO Windows Sleep latency!)
-        while (now.QuadPart < targetTicks) {
-            YieldProcessor();
-            QueryPerformanceCounter(&now);
+            // Safe VRR Clamps (Max 158 FPS ceiling, Min 30 FPS floor)
+            if (targetGapMs < 6.33) targetGapMs = 6.33; 
+            if (targetGapMs > 33.3) targetGapMs = 33.3;
+
+            double timeSinceLastPresent = (double)(now.QuadPart - g_lastPresentTime.QuadPart) * 1000.0 / g_qpcFreq.QuadPart;
+
+            // THE 0% CPU SPACER
+            if (timeSinceLastPresent < targetGapMs) {
+                double waitMs = targetGapMs - timeSinceLastPresent;
+                
+                LARGE_INTEGER dueTime;
+                dueTime.QuadPart = - (long long)(waitMs * 10000.0); // 100-ns intervals
+                
+                SetWaitableTimer(g_hTimer, &dueTime, 0, NULL, NULL, 0);
+                WaitForSingleObject(g_hTimer, INFINITE);
+                
+                // Update 'now' after waking up from the hardware sleep
+                QueryPerformanceCounter(&now);
+            }
         }
-        g_LastPresentTime.QuadPart = targetTicks; // Keep rhythm strict
     }
 
-    // 3. PRESENT FRAME
-    HRESULT res = oPresent(pSwapChain, 0, Flags | DXGI_PRESENT_ALLOW_TEARING);
-
-    // Mark the exact microsecond we return to the mod
-    QueryPerformanceCounter(&now);
-    g_LastReturnTime = now;
-
-    return res;
+    g_lastPresentTime = now;
+    
+    // Pass the frame with VRR Tearing flag explicitly enforced
+    return oPresent(pSwapChain, 0, Flags | DXGI_PRESENT_ALLOW_TEARING);
 }
 
 DWORD WINAPI MainThread(LPVOID lpReserved) {
@@ -93,8 +93,13 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
     }
     Sleep(2000); 
     
-    WriteLog("AutoPacer v6 woke up. Initializing Timers...");
+    WriteLog("Translation Layer v7 woke up. Initializing High-Res Timers...");
+
     QueryPerformanceFrequency(&g_qpcFreq);
+    
+    // Create the High-Resolution hardware timer (Windows 10/11)
+    g_hTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!g_hTimer) g_hTimer = CreateWaitableTimer(NULL, FALSE, NULL); // Failsafe
     
     WNDCLASSEXA wc = { sizeof(WNDCLASSEXA), CS_CLASSDC, DefWindowProcA, 0L, 0L, GetModuleHandleA(NULL), NULL, NULL, NULL, NULL, "DummyClass", NULL };
     RegisterClassExA(&wc);
