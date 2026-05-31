@@ -2,20 +2,17 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <chrono>
-#include <vector>
-#include <numeric>
 #include <stdio.h>
 #include <MinHook.h>
+
+#pragma comment(lib, "winmm.lib") // Required for precise timers
 
 typedef HRESULT(__stdcall* Present_t)(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags);
 Present_t oPresent = nullptr;
 
-std::vector<double> frameTimes;
 auto lastPresentTime = std::chrono::high_resolution_clock::now();
 bool hookSuccessful = false;
-
-// The Intel Monitor Pointer
-IDXGIOutput* pActiveOutput = nullptr;
+bool isInitialized = false; // Prevents double-injection lag
 
 void WriteLog(const char* message) {
     FILE* fp;
@@ -27,63 +24,36 @@ void WriteLog(const char* message) {
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
     if (!hookSuccessful) {
-        WriteLog("SUCCESS: First Frame Intercepted! AutoPacer is actively pacing frames.");
-        Beep(750, 300); 
+        WriteLog("SUCCESS: Lite Translation Layer Active. Pacing at max 158 FPS.");
+        Beep(750, 200); 
         hookSuccessful = true;
     }
 
-    // 1. DYNAMIC PACER (The Bouncer)
+    // THE TRAFFIC LIGHT: Enforce a strict minimum gap to prevent 165Hz PCIe bursts.
+    // 1000ms / 158 FPS = 6.33 milliseconds minimum gap.
+    const double minGapMs = 6.33; 
+
     auto now = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed = now - lastPresentTime;
 
-    if (elapsed.count() > 0 && elapsed.count() < 100.0) {
-        if (frameTimes.size() >= 10) {
-            frameTimes.erase(frameTimes.begin());
-        }
-        frameTimes.push_back(elapsed.count());
-    }
-
-    if (!frameTimes.empty()) {
-        double avgFrameTime = std::accumulate(frameTimes.begin(), frameTimes.end(), 0.0) / frameTimes.size();
-        double targetTime = avgFrameTime - 0.2; 
-
-        if (elapsed.count() < targetTime) {
-            while (true) {
-                auto spinNow = std::chrono::high_resolution_clock::now();
-                std::chrono::duration<double, std::milli> spinElapsed = spinNow - lastPresentTime;
-                if (spinElapsed.count() >= targetTime) break;
+    if (elapsed.count() < minGapMs) {
+        // Hybrid Sleep: Saves CPU performance (Fixes the 145->105 FPS drop)
+        while (elapsed.count() < minGapMs) {
+            double remaining = minGapMs - elapsed.count();
+            if (remaining > 2.0) {
+                Sleep(1); // Yield thread efficiently to game engine
+            } else {
+                YieldProcessor(); // Ultra-light spin for the final 1ms precision
             }
+            now = std::chrono::high_resolution_clock::now();
+            elapsed = now - lastPresentTime;
         }
-    }
-
-    // 2. CROSS-ADAPTER VBLANK SYNC (The Tear Killer)
-    // If we don't have the Intel monitor yet, find it.
-    if (!pActiveOutput) {
-        IDXGIFactory* pFactory = nullptr;
-        if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&pFactory))) {
-            IDXGIAdapter* pAdapter = nullptr;
-            // Scan all GPUs for an active monitor output (This will find the Intel iGPU)
-            for (UINT i = 0; pFactory->EnumAdapters(i, &pAdapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-                if (pAdapter->EnumOutputs(0, &pActiveOutput) != DXGI_ERROR_NOT_FOUND) {
-                    WriteLog("SUCCESS: Located Active Monitor. VBlank Sync Engaged.");
-                    pAdapter->Release();
-                    break;
-                }
-                pAdapter->Release();
-            }
-            pFactory->Release();
-        }
-    }
-
-    // If we found the Intel monitor, force NVIDIA to wait for its invisible refresh cycle
-    if (pActiveOutput) {
-        pActiveOutput->WaitForVBlank();
     }
 
     lastPresentTime = std::chrono::high_resolution_clock::now();
     
-    // Release the frame instantly (SyncInterval=0) because we manually handled the sync
-    return oPresent(pSwapChain, 0, Flags);
+    // Force VRR compatibility: SyncInterval 0, and ensure AllowTearing flag is present
+    return oPresent(pSwapChain, 0, Flags | DXGI_PRESENT_ALLOW_TEARING);
 }
 
 DWORD WINAPI MainThread(LPVOID lpReserved) {
@@ -92,7 +62,10 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
     }
     Sleep(2000); 
     
-    WriteLog("AutoPacer woke up. DXGI found. Attempting to hook...");
+    WriteLog("Translation Layer woke up. Attempting to hook...");
+    
+    // Increase Windows timer resolution for precision hybrid sleeping
+    timeBeginPeriod(1); 
     
     WNDCLASSEXA wc = { sizeof(WNDCLASSEXA), CS_CLASSDC, DefWindowProcA, 0L, 0L, GetModuleHandleA(NULL), NULL, NULL, NULL, NULL, "DummyClass", NULL };
     RegisterClassExA(&wc);
@@ -118,7 +91,7 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
         if (MH_CreateHook(pVTable[8], reinterpret_cast<LPVOID>(&hkPresent), reinterpret_cast<LPVOID*>(&oPresent)) == MH_OK) {
             MH_EnableHook(MH_ALL_HOOKS);
             WriteLog("DXGI Hook planted successfully.");
-            Beep(1000, 300); 
+            Beep(1000, 200); 
         }
 
         pSwapChain->Release();
@@ -132,8 +105,11 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hModule);
-        CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr);
+        if (!isInitialized) {
+            isInitialized = true;
+            DisableThreadLibraryCalls(hModule);
+            CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr);
+        }
     }
     return TRUE;
 }
