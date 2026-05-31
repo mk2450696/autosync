@@ -4,7 +4,7 @@
 #include <chrono>
 #include <vector>
 #include <numeric>
-#include <fstream>
+#include <stdio.h>
 #include <MinHook.h>
 
 typedef HRESULT(__stdcall* Present_t)(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags);
@@ -14,12 +14,12 @@ std::vector<double> frameTimes;
 auto lastPresentTime = std::chrono::high_resolution_clock::now();
 bool hookSuccessful = false;
 
-// Custom Log Writer
+// Safer C-Style Log Writer (Prevents initialization deadlocks)
 void WriteLog(const char* message) {
-    std::ofstream logFile("AutoPacer.log", std::ios_base::app);
-    if (logFile.is_open()) {
-        logFile << message << "\n";
-        logFile.close();
+    FILE* fp;
+    if (fopen_s(&fp, "AutoPacer.log", "a") == 0) {
+        fprintf(fp, "%s\n", message);
+        fclose(fp);
     }
 }
 
@@ -33,6 +33,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     auto now = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed = now - lastPresentTime;
 
+    // Track rolling average of last 10 frames (ignore huge spikes like menus)
     if (elapsed.count() > 0 && elapsed.count() < 100.0) {
         if (frameTimes.size() >= 10) {
             frameTimes.erase(frameTimes.begin());
@@ -41,9 +42,11 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
 
     if (!frameTimes.empty()) {
+        // Calculate exact dynamic target frame time
         double avgFrameTime = std::accumulate(frameTimes.begin(), frameTimes.end(), 0.0) / frameTimes.size();
         double targetTime = avgFrameTime - 0.2; // 0.2ms breathing buffer
 
+        // THE BOUNCER: Stop Micro-Bursts
         if (elapsed.count() < targetTime) {
             while (true) {
                 auto spinNow = std::chrono::high_resolution_clock::now();
@@ -54,11 +57,16 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
 
     lastPresentTime = std::chrono::high_resolution_clock::now();
+    
+    // Force SyncInterval = 0 to keep Intel VRR active
     return oPresent(pSwapChain, 0, Flags);
 }
 
 DWORD WINAPI MainThread(LPVOID lpReserved) {
-    WriteLog("AutoPacer injected into game process. Attempting to hook DXGI...");
+    // FIX FOR 18MB DEADLOCK: Wait 4 seconds for the game to fully boot before touching DirectX
+    Sleep(4000); 
+    
+    WriteLog("AutoPacer woke up. Attempting to hook DXGI...");
     
     WNDCLASSEXA wc = { sizeof(WNDCLASSEXA), CS_CLASSDC, DefWindowProcA, 0L, 0L, GetModuleHandleA(NULL), NULL, NULL, NULL, NULL, "DummyClass", NULL };
     RegisterClassExA(&wc);
