@@ -1,4 +1,4 @@
-name: Build AutoPacer
+name: Build AutoSync
 on: workflow_dispatch
 jobs:
   build:
