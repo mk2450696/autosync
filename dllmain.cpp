@@ -1,18 +1,19 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
-#include <chrono>
 #include <stdio.h>
 #include <MinHook.h>
-
-#pragma comment(lib, "winmm.lib") // Required for precise timers
 
 typedef HRESULT(__stdcall* Present_t)(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags);
 Present_t oPresent = nullptr;
 
-auto lastPresentTime = std::chrono::high_resolution_clock::now();
-bool hookSuccessful = false;
-bool isInitialized = false; // Prevents double-injection lag
+LARGE_INTEGER g_qpcFreq;
+LARGE_INTEGER g_lastTicks;
+long long g_targetTicks = 0;
+bool g_firstFrame = true;
+
+// TARGET FPS CEILING (Safe zone for 165Hz VRR)
+const double TARGET_FPS = 158.0;
 
 void WriteLog(const char* message) {
     FILE* fp;
@@ -23,36 +24,31 @@ void WriteLog(const char* message) {
 }
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
-    if (!hookSuccessful) {
-        WriteLog("SUCCESS: Lite Translation Layer Active. Pacing at max 158 FPS.");
-        Beep(750, 200); 
-        hookSuccessful = true;
+    if (g_firstFrame) {
+        WriteLog("SUCCESS: Pure QPC Translation Layer Active. Guarding at 158 FPS.");
+        Beep(750, 150);
+        Beep(1000, 150);
+        g_firstFrame = false;
     }
 
-    // THE TRAFFIC LIGHT: Enforce a strict minimum gap to prevent 165Hz PCIe bursts.
-    // 1000ms / 158 FPS = 6.33 milliseconds minimum gap.
-    const double minGapMs = 6.33; 
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
 
-    auto now = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed = now - lastPresentTime;
+    long long elapsedTicks = now.QuadPart - g_lastTicks.QuadPart;
 
-    if (elapsed.count() < minGapMs) {
-        // Hybrid Sleep: Saves CPU performance (Fixes the 145->105 FPS drop)
-        while (elapsed.count() < minGapMs) {
-            double remaining = minGapMs - elapsed.count();
-            if (remaining > 2.0) {
-                Sleep(1); // Yield thread efficiently to game engine
-            } else {
-                YieldProcessor(); // Ultra-light spin for the final 1ms precision
-            }
-            now = std::chrono::high_resolution_clock::now();
-            elapsed = now - lastPresentTime;
+    // THE MICROSECOND SPACER
+    // If the frame arrived faster than 6.33ms (Frame Gen Burst), hold it precisely.
+    if (elapsedTicks < g_targetTicks) {
+        long long spinUntil = g_lastTicks.QuadPart + g_targetTicks;
+        while (now.QuadPart < spinUntil) {
+            YieldProcessor(); // Hardware-level CPU pause (Zero OS scheduling lag)
+            QueryPerformanceCounter(&now);
         }
     }
 
-    lastPresentTime = std::chrono::high_resolution_clock::now();
-    
-    // Force VRR compatibility: SyncInterval 0, and ensure AllowTearing flag is present
+    g_lastTicks = now;
+
+    // Release the frame with forced VRR compatibility
     return oPresent(pSwapChain, 0, Flags | DXGI_PRESENT_ALLOW_TEARING);
 }
 
@@ -60,12 +56,14 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
     while (GetModuleHandleA("dxgi.dll") == NULL) {
         Sleep(100);
     }
-    Sleep(2000); 
+    Sleep(2000); // Give proxy mods time to unpack
     
-    WriteLog("Translation Layer woke up. Attempting to hook...");
-    
-    // Increase Windows timer resolution for precision hybrid sleeping
-    timeBeginPeriod(1); 
+    WriteLog("Translation Layer woke up. Initializing High-Res Timers...");
+
+    // Initialize High-Precision Hardware Timer
+    QueryPerformanceFrequency(&g_qpcFreq);
+    g_targetTicks = (g_qpcFreq.QuadPart * 10000000LL) / (long long)(TARGET_FPS * 10000000.0);
+    QueryPerformanceCounter(&g_lastTicks);
     
     WNDCLASSEXA wc = { sizeof(WNDCLASSEXA), CS_CLASSDC, DefWindowProcA, 0L, 0L, GetModuleHandleA(NULL), NULL, NULL, NULL, NULL, "DummyClass", NULL };
     RegisterClassExA(&wc);
@@ -90,8 +88,7 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
         MH_Initialize();
         if (MH_CreateHook(pVTable[8], reinterpret_cast<LPVOID>(&hkPresent), reinterpret_cast<LPVOID*>(&oPresent)) == MH_OK) {
             MH_EnableHook(MH_ALL_HOOKS);
-            WriteLog("DXGI Hook planted successfully.");
-            Beep(1000, 200); 
+            WriteLog("DXGI Hook planted successfully via dummy device.");
         }
 
         pSwapChain->Release();
@@ -100,16 +97,13 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
     }
     DestroyWindow(hWnd);
     UnregisterClassA("DummyClass", wc.hInstance);
-    return TRUE;
+    return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        if (!isInitialized) {
-            isInitialized = true;
-            DisableThreadLibraryCalls(hModule);
-            CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr);
-        }
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+        CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr);
     }
     return TRUE;
 }
