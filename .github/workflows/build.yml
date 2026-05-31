@@ -1,4 +1,4 @@
-name: Build AutoSync
+name: Build AutoPacer
 on: workflow_dispatch
 jobs:
   build:
@@ -13,8 +13,9 @@ jobs:
       run: vcpkg install minhook:x64-windows
       
     - name: Compile the DLL
+      shell: cmd
       run: |
-        cl.exe /O2 /LD /MT /EHsc dllmain.cpp /I C:\vcpkg\installed\x64-windows\include /link /LIBPATH:C:\vcpkg\installed\x64-windows\lib minhook.lib d3d11.lib dxgi.lib user32.lib /OUT:AutoPacer.dll
+        cl.exe /O2 /LD /MT /EHsc dllmain.cpp /I "%VCPKG_INSTALLATION_ROOT%\installed\x64-windows\include" /link /LIBPATH:"%VCPKG_INSTALLATION_ROOT%\installed\x64-windows\lib" minhook.lib d3d11.lib dxgi.lib user32.lib /OUT:AutoPacer.dll
         
     - name: Upload Finished DLL
       uses: actions/upload-artifact@v4
