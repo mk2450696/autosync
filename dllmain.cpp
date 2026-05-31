@@ -14,7 +14,6 @@ std::vector<double> frameTimes;
 auto lastPresentTime = std::chrono::high_resolution_clock::now();
 bool hookSuccessful = false;
 
-// Safer C-Style Log Writer (Prevents initialization deadlocks)
 void WriteLog(const char* message) {
     FILE* fp;
     if (fopen_s(&fp, "AutoPacer.log", "a") == 0) {
@@ -26,14 +25,13 @@ void WriteLog(const char* message) {
 HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
     if (!hookSuccessful) {
         WriteLog("SUCCESS: First Frame Intercepted! AutoPacer is actively pacing frames.");
-        Beep(750, 300); // Beep out loud when the first frame is grabbed
+        Beep(750, 300); 
         hookSuccessful = true;
     }
 
     auto now = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed = now - lastPresentTime;
 
-    // Track rolling average of last 10 frames (ignore huge spikes like menus)
     if (elapsed.count() > 0 && elapsed.count() < 100.0) {
         if (frameTimes.size() >= 10) {
             frameTimes.erase(frameTimes.begin());
@@ -42,11 +40,9 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
 
     if (!frameTimes.empty()) {
-        // Calculate exact dynamic target frame time
         double avgFrameTime = std::accumulate(frameTimes.begin(), frameTimes.end(), 0.0) / frameTimes.size();
-        double targetTime = avgFrameTime - 0.2; // 0.2ms breathing buffer
+        double targetTime = avgFrameTime - 0.2; 
 
-        // THE BOUNCER: Stop Micro-Bursts
         if (elapsed.count() < targetTime) {
             while (true) {
                 auto spinNow = std::chrono::high_resolution_clock::now();
@@ -57,16 +53,17 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
 
     lastPresentTime = std::chrono::high_resolution_clock::now();
-    
-    // Force SyncInterval = 0 to keep Intel VRR active
     return oPresent(pSwapChain, 0, Flags);
 }
 
 DWORD WINAPI MainThread(LPVOID lpReserved) {
-    // FIX FOR 18MB DEADLOCK: Wait 4 seconds for the game to fully boot before touching DirectX
-    Sleep(4000); 
+    // Wait until the game naturally loads DirectX before doing anything
+    while (GetModuleHandleA("dxgi.dll") == NULL) {
+        Sleep(100);
+    }
+    Sleep(2000); // Give the engine an extra 2 seconds to unpack
     
-    WriteLog("AutoPacer woke up. Attempting to hook DXGI...");
+    WriteLog("AutoPacer woke up. DXGI found. Attempting to hook...");
     
     WNDCLASSEXA wc = { sizeof(WNDCLASSEXA), CS_CLASSDC, DefWindowProcA, 0L, 0L, GetModuleHandleA(NULL), NULL, NULL, NULL, NULL, "DummyClass", NULL };
     RegisterClassExA(&wc);
@@ -92,7 +89,7 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
         if (MH_CreateHook(pVTable[8], reinterpret_cast<LPVOID>(&hkPresent), reinterpret_cast<LPVOID*>(&oPresent)) == MH_OK) {
             MH_EnableHook(MH_ALL_HOOKS);
             WriteLog("DXGI Hook planted successfully.");
-            Beep(1000, 300); // Beep when hook is planted
+            Beep(1000, 300); 
         } else {
             WriteLog("ERROR: Failed to plant DXGI Hook.");
         }
