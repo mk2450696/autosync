@@ -1,11 +1,10 @@
-// AutoPacer v39 - The Dynamic Async Container (The Holy Grail)
+// AutoPacer v40 - The True FPS Container (Non-Blocking)
 //
-// Perfectly decouples the Mod's bursty PCIe submission from the Intel hardware delivery.
-// 1. Mod drops frames into a thread-safe queue and gets an instant S_OK (No blocking, no flashing).
-// 2. The producer tracks the true, natural FPS of the game using a 32-frame rolling average.
-// 3. The consumer background thread dynamically updates its delivery pace to exactly match 
-//    the rolling average, ensuring the Intel driver receives perfectly un-bunched frames 
-//    safely within the 165Hz VRR window.
+// 1. Tracks real-time FPS natively without feedback loops.
+// 2. NEVER blocks the CPU. If the proxy queue fills up, it silently drops the 
+//    oldest frame instead of freezing the game engine (Fixes the 56 FPS lock & loading bug).
+// 3. The background thread adapts dynamically to the tracked FPS, but strictly 
+//    clamps the delivery to 155 FPS to guarantee VRR stays active on a 165Hz monitor.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -24,7 +23,7 @@ static char g_logPath[MAX_PATH] = "AutoPacer.log";
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v39] %s\n", msg);
+        fprintf(fp, "[AutoPacer v40] %s\n", msg);
         fclose(fp);
     }
 }
@@ -47,7 +46,7 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── The Dynamic Container State ───────────────────────────────────────────────
+// ── The Container State ───────────────────────────────────────────────────────
 struct PresentArgs {
     IDXGISwapChain* pSC;
     UINT SyncInterval;
@@ -56,18 +55,14 @@ struct PresentArgs {
 
 static std::queue<PresentArgs> g_Queue;
 static std::mutex g_Mutex;
-static std::condition_variable g_CV_Produce;
 static std::condition_variable g_CV_Consume;
 
 static LARGE_INTEGER g_qpcFreq;
 static double g_LastProduceTime = 0.0;
 static double g_LastReleaseTime = 0.0;
 
-// Dynamic Pacing Variables
-const int HISTORY_SIZE = 32;
-static double g_DeltaHistory[HISTORY_SIZE];
-static int g_HistoryIdx = 0;
-static std::atomic<double> g_DynamicTargetMs{ 16.666 }; // Default 60fps start
+// FPS Tracker
+static std::atomic<double> g_CurrentFPS{ 60.0 }; 
 
 static double GetTimeMs() {
     LARGE_INTEGER qpc;
@@ -75,44 +70,45 @@ static double GetTimeMs() {
     return (double)(qpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
 }
 
-// ── Hooked Present (The Producer) ─────────────────────────────────────────────
+// ── Hooked Present (The Non-Blocking Producer) ────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
     double now = GetTimeMs();
     
-    // 1. Calculate Dynamic Framerate
+    // 1. Track True FPS
     if (g_LastProduceTime > 0.0) {
         double gap = now - g_LastProduceTime;
-        // Ignore load screens and massive stutters in our average
-        if (gap > 2.0 && gap < 100.0) {
-            g_DeltaHistory[g_HistoryIdx] = gap;
-            g_HistoryIdx = (g_HistoryIdx + 1) % HISTORY_SIZE;
-            
-            double sum = 0.0;
-            for(int i = 0; i < HISTORY_SIZE; i++) sum += g_DeltaHistory[i];
-            g_DynamicTargetMs.store(sum / (double)HISTORY_SIZE);
+        if (gap > 1.0 && gap < 100.0) { // Ignore load screen pauses
+            double instantFPS = 1000.0 / gap;
+            // Smooth FPS rolling average
+            double current = g_CurrentFPS.load();
+            g_CurrentFPS.store((current * 0.95) + (instantFPS * 0.05));
         }
     }
     g_LastProduceTime = now;
 
-    // 2. Put Frame in the Container
-    std::unique_lock<std::mutex> lock(g_Mutex);
+    // 2. Put Frame in the Container (NEVER BLOCK)
+    {
+        std::unique_lock<std::mutex> lock(g_Mutex);
+        
+        // If the queue has 3 frames, we are exceeding the delivery speed.
+        // Silently drop the oldest frame. This guarantees the CPU is NEVER delayed.
+        while (g_Queue.size() >= 3) {
+            g_Queue.pop(); 
+        }
+        
+        g_Queue.push({ pSC, SyncInterval, Flags });
+    }
     
-    // Allow up to 4 frames in the queue. 
-    // This gives the Mod massive breathing room to prevent the static-flashing crashes,
-    // while ensuring we don't exceed the 6-buffer DXGI limit.
-    g_CV_Produce.wait(lock, [] { return g_Queue.size() < 4; });
-    
-    g_Queue.push({ pSC, SyncInterval, Flags });
     g_CV_Consume.notify_one();
     
-    // 3. Return instantly so the Mod never blocks
+    // 3. Return instantly. The game runs free.
     return S_OK; 
 }
 
 // ── Background Pacer Thread (The Consumer) ────────────────────────────────────
 static DWORD WINAPI PacerThread(LPVOID) {
-    Log("Dynamic Asynchronous Container Thread started.");
+    Log("True FPS Container Thread started. CPU blocking is DELETED.");
     int logCounter = 0;
     
     while (true) {
@@ -125,38 +121,36 @@ static DWORD WINAPI PacerThread(LPVOID) {
             args = g_Queue.front();
             g_Queue.pop();
         }
-        g_CV_Produce.notify_one();
 
-        // 2. Get the Dynamic Target and Clamp it safely for VRR
-        double target = g_DynamicTargetMs.load();
-        if (target < 6.25) target = 6.25; // MAX = 160 FPS (Keeps it safely under 165Hz limit)
-        if (target > 33.3) target = 33.3; // MIN = 30 FPS
+        // 2. Adapt to FPS, but Protect VRR
+        double fps = g_CurrentFPS.load();
+        if (fps > 155.0) fps = 155.0; // Hard clamp to prevent tearing on 165Hz monitor
+        if (fps < 30.0) fps = 30.0;
+        
+        double targetGapMs = 1000.0 / fps;
 
-        // 3. The Tollbooth (Pace the hardware delivery)
+        // 3. Perfect Delivery Timing
         if (g_LastReleaseTime > 0.0) {
-            double targetTime = g_LastReleaseTime + target;
+            double targetTime = g_LastReleaseTime + targetGapMs;
             double now = GetTimeMs();
             
-            // Anti-Starvation check: If the game paused (e.g. menus), reset the clock
-            // so we don't try to rapidly "catch up" and spam the Intel driver.
-            if (now > targetTime + target) {
-                targetTime = now;
-            }
+            // Anti-Starvation: Don't speed-up if the game paused
+            if (now > targetTime + 20.0) targetTime = now;
             
             while (GetTimeMs() < targetTime) {
                 YieldProcessor(); // Ultra-precise micro-spin
             }
         }
         
-        // 4. Deliver to Intel Driver
+        // 4. Send to Intel Driver
         g_LastReleaseTime = GetTimeMs();
         oPresent(args.pSC, args.SyncInterval, args.Flags);
 
-        // 5. Periodic Logging (Every 600 frames = ~5 seconds)
+        // 5. Periodic Logging (Every ~5 seconds)
         logCounter++;
         if (logCounter % 600 == 0) {
-            Logf("Dynamic Pacer Status -> Target Gap: %.3f ms (%.1f FPS) | Queue Size: %zu", 
-                 target, 1000.0 / target, g_Queue.size());
+            Logf("Dynamic Pacer -> Game FPS: %.1f | Delivering at: %.1f FPS | Gap: %.3f ms", 
+                 g_CurrentFPS.load(), fps, targetGapMs);
         }
     }
     return 0;
@@ -202,14 +196,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(hModule);
         QueryPerformanceFrequency(&g_qpcFreq);
         
-        // Pre-fill history to 60fps to prevent math errors on boot
-        for (int i = 0; i < HISTORY_SIZE; i++) g_DeltaHistory[i] = 16.666;
-
         char dllPath[MAX_PATH] = {}; GetModuleFileNameA(hModule, dllPath, sizeof(dllPath));
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) { *(lastSlash + 1) = '\0'; snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath); }
         remove(g_logPath);
-        Log("DLL Booted - v39 The Dynamic Async Container");
+        Log("DLL Booted - v40 The True FPS Container");
         
         CreateThread(nullptr, 0, PacerThread, nullptr, 0, nullptr);
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
