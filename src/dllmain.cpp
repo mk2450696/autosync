@@ -1,17 +1,9 @@
-// AutoPacer v16 - Dummy Swapchain VTable Hooking
+// AutoPacer v17 - Asynchronous Smart Pacer
 //
-// WHY v15 FAILED: We waited 500ms to avoid mod conflicts, which meant the game
-//                 had already created its swapchain. Our CreateSwapChain hook missed it.
-//
-// THE v16 APPROACH:
-//   1. Wait 500ms until the game is fully running and all mods have hooked.
-//   2. Create a temporary, invisible D3D11 Dummy Swapchain.
-//   3. Extract the VTable address from our dummy swapchain. Because COM vtables
-//      are shared across the entire process, this is the exact same vtable used
-//      by the game's real swapchain.
-//   4. Read Slot 8 (Present). It will point to DLSS Enabler's hook or DXGI original.
-//   5. Overwrite Slot 8 with our HookedPresent, then destroy our dummy swapchain.
-//   6. The next time the game calls Present on its real swapchain, we intercept it!
+// Hooks the real swapchain via the dummy vtable method (proven successful in v16).
+// Replaces the Waitable Object with a high-precision QPC (QueryPerformanceCounter)
+// time-spacer. It detects FG burst frames and spaces them exactly halfway between
+// the base frames, restoring smooth VRR cadence without adding base frame input lag.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -20,7 +12,6 @@
 #include <dxgi1_2.h>
 #include <dxgi1_6.h>
 #include <d3d11.h>
-#include <dwmapi.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
@@ -33,14 +24,14 @@ static char             g_logPath[MAX_PATH] = "AutoPacer.log";
 
 static void Log(const char* msg)
 {
-    OutputDebugStringA("[AutoPacer v16] ");
+    OutputDebugStringA("[AutoPacer v17] ");
     OutputDebugStringA(msg);
     OutputDebugStringA("\n");
     if (!g_logCSInit) return;
     EnterCriticalSection(&g_logCS);
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v16] %s\n", msg);
+        fprintf(fp, "[AutoPacer v17] %s\n", msg);
         fclose(fp);
     }
     LeaveCriticalSection(&g_logCS);
@@ -51,15 +42,22 @@ static void Logf(const char* fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, a); va_end(a); Log(buf);
 }
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── State & Pacing Variables ──────────────────────────────────────────────────
 static std::atomic<bool> g_PresentHooked { false };
-static bool              g_WaitableActive = false;
-static bool              g_DwmFallback    = false;
-static bool              g_FirstFrame     = true;
-static HANDLE            g_hWaitable      = nullptr;
+static bool              g_FirstFrame    = true;
 
-static const UINT  FRAME_LATENCY    = 1;
-static const DWORD WAITABLE_TIMEOUT = 33;
+// High Precision Timing
+static LARGE_INTEGER g_qpcFreq;
+static double        g_LastPresentTime = 0.0;
+static double        g_LastBaseTime    = 0.0;
+static double        g_BaseInterval    = 16.666; // Assume 60fps start
+
+static double GetTimeMs()
+{
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    return (double)(qpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+}
 
 // ── VTable helpers ────────────────────────────────────────────────────────────
 static bool WritePtr(void** addr, void* newVal, void** oldVal)
@@ -72,60 +70,58 @@ static bool WritePtr(void** addr, void* newVal, void** oldVal)
     return true;
 }
 
-// ── Function pointer types ────────────────────────────────────────────────────
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── Waitable / DWM fallback setup ─────────────────────────────────────────────
-static void SetupSync(IDXGISwapChain* sc)
-{
-    IDXGISwapChain2* sc2 = nullptr;
-    if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2)))
-    {
-        HANDLE h = sc2->GetFrameLatencyWaitableObject();
-        if (h)
-        {
-            sc2->SetMaximumFrameLatency(FRAME_LATENCY);
-            g_hWaitable      = h;
-            g_WaitableActive = true;
-            Log("Sync mode: WAITABLE OBJECT (pipeline-sync to Intel VBlank)");
-        }
-        sc2->Release();
-    }
-
-    if (!g_WaitableActive)
-    {
-        g_DwmFallback = true;
-        Log("Sync mode: DWM FLUSH fallback (BitBlt swapchain, no waitable available)");
-    }
-}
-
-// ── Hooked Present ────────────────────────────────────────────────────────────
+// ── Hooked Present (The Smart Pacer) ──────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
     if (g_FirstFrame)
     {
+        QueryPerformanceFrequency(&g_qpcFreq);
+        g_LastPresentTime = GetTimeMs();
+        g_LastBaseTime = g_LastPresentTime;
         g_FirstFrame = false;
-        Log("First Present intercepted! We have the REAL game swapchain.");
-        SetupSync(pSC);
-        Logf("  Waitable=%s DwmFallback=%s",
-            g_WaitableActive ? "YES" : "NO",
-            g_DwmFallback    ? "YES" : "NO");
+        
+        Log("First Present intercepted! Smart Pacer is now active.");
         Beep(1000, 120);
     }
 
-    if (g_WaitableActive && g_hWaitable)
+    double currentTime = GetTimeMs();
+    double timeSinceLast = currentTime - g_LastPresentTime;
+
+    // Detect FG burst frames (arriving less than 3.5ms after the previous frame)
+    if (timeSinceLast < 3.5)
     {
-        DWORD r = WaitForSingleObjectEx(g_hWaitable, WAITABLE_TIMEOUT, FALSE);
-        if (r == WAIT_TIMEOUT) Log("WARNING: waitable timeout");
+        // Target time is exactly halfway between the last base frame and the expected next base frame
+        double targetTime = g_LastBaseTime + (g_BaseInterval / 2.0);
+        
+        // Safety clamp: don't delay more than 16ms to avoid aggressive stuttering
+        if (targetTime - currentTime > 16.0) targetTime = currentTime + 16.0;
+
+        // Spin-yield loop (ultra low latency, high precision wait)
+        while (GetTimeMs() < targetTime) {
+            YieldProcessor(); 
+        }
+
+        g_LastPresentTime = GetTimeMs();
     }
-    else if (g_DwmFallback)
+    else
     {
-        DwmFlush();
+        // This is a normal Base Frame.
+        double currentBaseInterval = currentTime - g_LastBaseTime;
+        
+        // Smooth the average interval (clamp between 6ms and 33ms to ignore menu spikes/stutters)
+        if (currentBaseInterval > 6.0 && currentBaseInterval < 33.0) {
+            g_BaseInterval = (g_BaseInterval * 0.8) + (currentBaseInterval * 0.2);
+        }
+        
+        g_LastBaseTime = currentTime;
+        g_LastPresentTime = currentTime;
     }
 
-    // Call DLSS Enabler / Original Present. 
+    // Call DLSS Enabler / Original Present
     return oPresent(pSC, SyncInterval, Flags);
 }
 
@@ -139,7 +135,6 @@ static DWORD WINAPI InitThread(LPVOID)
     if (!GetModuleHandleA("dxgi.dll")) { Log("ERROR: dxgi.dll never loaded"); return 1; }
     Log("dxgi.dll present");
 
-    // Wait for the game window to appear
     HWND gameWnd = nullptr;
     for (int i = 0; i < 600; ++i)
     {
@@ -160,16 +155,14 @@ static DWORD WINAPI InitThread(LPVOID)
         }
     }
 
-    // Wait for DLSS Enabler and OptiScaler to finish hooking the game
+    // Wait for DLSS Enabler and OptiScaler to finish hooking
     Sleep(500);
     Log("Mod settle time elapsed. Spawning dummy swapchain to steal VTable.");
 
-    // Create Dummy Window
     WNDCLASSEXA wc = { sizeof(wc), CS_OWNDC, DefWindowProcA, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, "DummyWindow", nullptr };
     RegisterClassExA(&wc);
     HWND dummyWnd = CreateWindowA("DummyWindow", "Dummy", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
 
-    // Dummy Swapchain Setup
     DXGI_SWAP_CHAIN_DESC sd = {};
     sd.BufferCount = 1;
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -191,27 +184,18 @@ static DWORD WINAPI InitThread(LPVOID)
     {
         void** vtable = *(void***)pDummySC;
         
-        // Slot 8 currently contains either Original Present or DLSS Enabler's Present hook
         if (WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent))
         {
-            Logf("SUCCESS: Present chain wrap installed via dummy vtable! Slot 8 was: %p", oPresent);
+            Logf("SUCCESS: Present chain wrap installed! Slot 8 was: %p", oPresent);
             g_PresentHooked = true;
         }
-        else
-        {
-            Log("ERROR: VTable write failed.");
-        }
+        else Log("ERROR: VTable write failed.");
 
-        // Cleanup the dummy device/swapchain immediately
         pDummySC->Release();
         pDummyDev->Release();
     }
-    else
-    {
-        Logf("ERROR: Dummy swapchain creation failed: 0x%08X", (unsigned)hr);
-    }
+    else Logf("ERROR: Dummy swapchain creation failed: 0x%08X", (unsigned)hr);
 
-    // Cleanup Dummy Window
     DestroyWindow(dummyWnd);
     UnregisterClassA("DummyWindow", wc.hInstance);
 
@@ -236,12 +220,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath);
         }
 
-        Log("DLL loaded - v16 Dummy Swapchain approach");
+        Log("DLL loaded - v17 Smart Pacer approach");
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
-        if (g_hWaitable) CloseHandle(g_hWaitable);
         if (g_logCSInit) DeleteCriticalSection(&g_logCS);
     }
     return TRUE;
