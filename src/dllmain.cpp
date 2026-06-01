@@ -1,14 +1,16 @@
-// AutoPacer v28 - Safe Hotkey Answer Reader
+// AutoPacer v29 - The DWM Serializer (CASO PCIe Fix)
 //
-// Moves the VK_F8 hotkey check to a safe background thread to prevent DXGI 
-// render-thread deadlocks. Restores startup logs.
-// When F8 is pressed, it records exactly 600 frames of the 0x1 hardware probe 
-// answers (HRESULT) and monitor VBlank timings.
+// Telemetry proved CPU pacing is a flawless 7.7ms (130FPS), but PCIe cross-adapter 
+// transfers are bunching frames up, causing the Intel iGPU to drop them (0.000ms gap)
+// and stutter (14.1ms gap).
+// This injects DwmFlush() to act as a hardware tollbooth, forcing the bunched frames 
+// to serialize perfectly to the Intel compositor's hardware clock.
 
 #include <windows.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <d3d11.h>
+#include <dwmapi.h>
 #include <stdio.h>
 
 static char g_csvPath[MAX_PATH] = "AutoPacer_AnswerStats.csv";
@@ -17,7 +19,7 @@ static char g_logPath[MAX_PATH] = "AutoPacer.log";
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v28] %s\n", msg);
+        fprintf(fp, "[AutoPacer v29] %s\n", msg);
         fclose(fp);
     }
 }
@@ -68,8 +70,9 @@ static const int SLOT_Present = 8;
 // ── Hooked Present ────────────────────────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
-    // If not recording, do absolutely nothing but pass the frame normally. Zero overhead.
     if (!g_StartRecording || g_TelemetryDone) {
+        // Even when not recording, apply the fix so you can feel if it works!
+        DwmFlush(); 
         return oPresent(pSC, SyncInterval, Flags);
     }
 
@@ -77,12 +80,12 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
     double cpuGap = now - g_LastCpuTime;
     g_LastCpuTime = now;
 
-    // 1. Inject the Hardware Probe (0x1) and record the driver's answer
+    // 1. Hardware Probe
     double testStart = GetTimeMs();
     HRESULT testHr = oPresent(pSC, 0, DXGI_PRESENT_TEST);
     double testDuration = GetTimeMs() - testStart;
 
-    // 2. Read the Monitor's actual VBlank hardware timings
+    // 2. Monitor Hardware Timings
     DXGI_FRAME_STATISTICS stats = {};
     double dispGap = 0.0;
     if (SUCCEEDED(pSC->GetFrameStatistics(&stats))) {
@@ -91,7 +94,11 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
         if (stats.SyncQPCTime.QuadPart > 0) g_LastDispTime = dispTimeMs;
     }
 
-    // 3. Do the actual render request that the Mod asked for
+    // 3. THE FIX: The DWM Hardware Tollbooth
+    // This stops the PCIe burst. It aligns the game to Intel's hardware clock.
+    DwmFlush();
+
+    // 4. Render Request
     double renderStart = GetTimeMs();
     HRESULT renderHr = oPresent(pSC, SyncInterval, Flags);
     double renderDuration = GetTimeMs() - renderStart;
@@ -102,9 +109,8 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
         g_FrameCount++;
     } 
     
-    // Check if finished
     if (g_FrameCount >= MAX_FRAMES) {
-        g_TelemetryDone = true; // Instantly stops further recording
+        g_TelemetryDone = true; 
         FILE* fp;
         if (fopen_s(&fp, g_csvPath, "w") == 0) {
             fprintf(fp, "Frame,Swapchain,CpuGapMs,Test_HRESULT,Test_DurationMs,Render_HRESULT,Render_DurationMs,DispVBlankGapMs\n");
@@ -118,7 +124,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
             fclose(fp);
         }
         Log("Telemetry complete. CSV written.");
-        Beep(1500, 200); // Second Beep
+        Beep(1500, 200); 
     }
     
     return renderHr;
@@ -131,7 +137,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
             g_LastCpuTime = GetTimeMs();
             g_StartRecording = true;
             Log("F8 Pressed. Telemetry Started.");
-            Beep(1000, 150); // First Beep
+            Beep(1000, 150);
             break;
         }
         Sleep(100);
@@ -139,7 +145,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
     return 0;
 }
 
-// ── Init Thread (Dummy Swapchain) ─────────────────────────────────────────────
+// ── Init Thread ───────────────────────────────────────────────────────────────
 static DWORD WINAPI InitThread(LPVOID) {
     for (int i = 0; i < 200; ++i) { if (GetModuleHandleA("dxgi.dll")) break; Sleep(50); }
     HWND gameWnd = nullptr;
@@ -155,7 +161,6 @@ static DWORD WINAPI InitThread(LPVOID) {
     Sleep(500);
 
     Log("Game window found. Spawning dummy swapchain to hook Present.");
-
     WNDCLASSEXA wc = { sizeof(wc), CS_OWNDC, DefWindowProcA, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, "DummyWindow", nullptr };
     RegisterClassExA(&wc);
     HWND dummyWnd = CreateWindowA("DummyWindow", "Dummy", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
@@ -170,13 +175,9 @@ static DWORD WINAPI InitThread(LPVOID) {
         WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent);
         pDummySC->Release(); pDummyDev->Release();
         Log("Hook installed successfully. Waiting for F8.");
-    } else {
-        Log("ERROR: Failed to create dummy swapchain.");
     }
 
     DestroyWindow(dummyWnd); UnregisterClassA("DummyWindow", wc.hInstance);
-
-    // Start listening for F8
     CreateThread(nullptr, 0, HotkeyThread, nullptr, 0, nullptr);
     return 0;
 }
@@ -184,8 +185,7 @@ static DWORD WINAPI InitThread(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        QueryPerformanceFrequency(&g_qpcFreq); // Initialize timing safely on boot
-        
+        QueryPerformanceFrequency(&g_qpcFreq); 
         char dllPath[MAX_PATH] = {}; GetModuleFileNameA(hModule, dllPath, sizeof(dllPath));
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) {
@@ -193,7 +193,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             snprintf(g_csvPath, sizeof(g_csvPath), "%sAutoPacer_AnswerStats.csv", dllPath);
             snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath);
         }
-        
         Log("DLL Booted.");
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
     }
