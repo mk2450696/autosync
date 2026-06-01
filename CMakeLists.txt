@@ -22,6 +22,7 @@ target_link_libraries(AutoPacer PRIVATE
     dxguid.lib
     user32.lib
     dwmapi.lib
+    psapi.lib
 )
 
 target_link_options(AutoPacer PRIVATE /LTCG)
