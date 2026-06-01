@@ -1,71 +1,40 @@
-// AutoPacer v12 - DWM Scanline-Safe Pacing for CASO iGPU+dGPU setups
+// AutoPacer v13 - Waitable Swapchain Injection for CASO iGPU+dGPU setups
 //
-// ROOT CAUSE IDENTIFIED:
-//   All prior versions (v8-v11) stripped DXGI_PRESENT_ALLOW_TEARING from Present flags.
-//   That flag is what activates VRR on the display. Stripping it = static 165Hz = VRR dead.
-//   This is why the monitor showed static 165Hz in every version.
+// APPROACH: Hook IDXGIFactory::CreateSwapChain and CreateSwapChainForHwnd.
+// When the game creates its swapchain, we add:
+//   DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+// This gives us a handle synchronized to the display pipeline (Intel's VBlank
+// on this system). A dedicated pacer thread waits on this handle before each
+// Present, ensuring frames are only submitted when Intel's pipeline is ready.
 //
-// v12 APPROACH:
-//   1. NEVER strip DXGI_PRESENT_ALLOW_TEARING. VRR must stay on.
-//   2. Use DwmGetCompositionTimingInfo() to read Intel's scanout timing directly.
-//      DWM runs on Intel UHD 730 (confirmed: DWM on GPU1/Intel in Task Manager).
-//      DWM timing gives us: qpcRefreshPeriod, qpcVBlank, cRefreshesDisplayed.
-//   3. For burst frames: use DWM timing to calculate if we're in the "danger zone"
-//      (middle of active scanout). If yes, delay by microseconds to slip past it.
-//      If no, pass through immediately.
-//   4. For normal frames: pass through with zero intervention.
+// This is fundamentally different from all prior versions:
+// - No external clock approximation (QPC, DWM timestamps)
+// - No VBlank relay thread racing against Present
+// - The waitable object IS Intel's pipeline signal
+// - ALLOW_TEARING preserved -> VRR stays active
+// - FG frames still generated normally; only their Present timing is gated
 //
-// WHY THIS WORKS WHERE OTHERS FAILED:
-//   RTSS Scanline Sync queries NVIDIA's raster position - wrong GPU, wrong timing.
-//   v10-v11 VBlank relay used WaitForVBlank on Intel output BUT stripped ALLOW_TEARING,
-//   killing VRR. v12 uses DWM timing (Intel-native) AND preserves ALLOW_TEARING.
-//
-// RESULT: VRR active + frames timed to Intel's actual scanout = no tearing, no judder,
-//         no FPS cap, FG works normally.
+// FLOW:
+//   1. Hook factory CreateSwapChain/CreateSwapChainForHwnd at DLL load
+//   2. Game calls CreateSwapChain -> we add WAITABLE flag, intercept result
+//   3. We call GetFrameLatencyWaitableObject() on the swapchain
+//   4. We hook Present on the returned swapchain's vtable
+//   5. HookedPresent: wait on waitable object (max 1 frame), then present
+//   6. Waitable object signals when Intel's pipeline consumed the last frame
+//   Result: every frame presented exactly when Intel is ready for it
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <dxgi1_6.h>
 #include <d3d11.h>
-#include <dwmapi.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
 #include <atomic>
 #include <immintrin.h>
-
-// ── Configuration ─────────────────────────────────────────────────────────────
-// Frames arriving faster than this are FG burst frames needing intervention.
-// 3.5ms = ~285fps. FG bursts arrive <1ms apart. Normal frames >5ms apart.
-static const long long BURST_THRESHOLD_NS = 3500000LL;
-
-// Fraction of the refresh period considered "safe" at the start (post-VBlank).
-// At 165Hz: period=6.06ms, safe zone = first 15% = ~0.9ms.
-// We present only if we're within this window after the last VBlank.
-// If not, we wait until the NEXT VBlank + this offset.
-static const double SAFE_FRACTION = 0.15;
-// ──────────────────────────────────────────────────────────────────────────────
-
-// DWM timing function - gives us Intel's actual scanout clock
-typedef HRESULT (WINAPI *PFN_DwmGetCompositionTimingInfo)(HWND, DWM_TIMING_INFO*);
-static PFN_DwmGetCompositionTimingInfo pfnDwmGetTimingInfo = nullptr;
-
-static IDXGIOutput*      g_IntelOutput   = nullptr;
-static std::atomic<bool> g_Running       { false };
-static HANDLE            g_hVBlankThread = nullptr;
-static HANDLE            g_hVBlankEvent  = nullptr;  // auto-reset, fires each VBlank
-
-// Latest VBlank QPC timestamp from Intel output (written by VBlank thread)
-static std::atomic<LONGLONG> g_LastVBlankQPC    { 0 };
-static std::atomic<LONGLONG> g_VBlankPeriodQPC  { 0 };
-
-typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
-static PFN_Present oPresent         = nullptr;
-static LONGLONG    g_QPCFreq        = 0;
-static LONGLONG    g_LastPresentQPC = 0;
-static bool        g_FirstFrame     = true;
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 static void Log(const char* msg)
@@ -76,266 +45,78 @@ static void Log(const char* msg)
 }
 static void Logf(const char* fmt, ...)
 {
-    char buf[512]; va_list a; va_start(a, fmt); vsnprintf(buf, sizeof(buf), fmt, a); va_end(a);
-    Log(buf);
+    char buf[512]; va_list a; va_start(a, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, a); va_end(a); Log(buf);
 }
+
+// ── State ─────────────────────────────────────────────────────────────────────
+static HANDLE g_hWaitableObject  = nullptr;  // from GetFrameLatencyWaitableObject
+static bool   g_FirstFrame       = true;
+static bool   g_WaitableActive   = false;    // true once we have a valid waitable SC
+
+// Frame latency: 1 = minimum latency (present as soon as pipeline ready)
+// If FG artifacts appear, try 2.
+static const UINT FRAME_LATENCY = 1;
+
+// Timeout for waitable wait: 1 full frame at 48Hz (lowest VRR) = ~21ms
+static const DWORD WAITABLE_TIMEOUT_MS = 25;
 
 // ── VTable patch ──────────────────────────────────────────────────────────────
-static bool PatchVTable(void** vtable, int slot, void* newFn, void** oldFn)
+static bool PatchVTable(void** vt, int slot, void* newFn, void** oldFn)
 {
     DWORD old;
-    if (!VirtualProtect(&vtable[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) return false;
-    *oldFn = vtable[slot]; vtable[slot] = newFn;
-    VirtualProtect(&vtable[slot], sizeof(void*), old, &old);
+    if (!VirtualProtect(&vt[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) return false;
+    *oldFn = vt[slot]; vt[slot] = newFn;
+    VirtualProtect(&vt[slot], sizeof(void*), old, &old);
     return true;
 }
 
-// ── Find Intel IDXGIOutput ────────────────────────────────────────────────────
-static IDXGIOutput* FindPrimaryOutput()
+// ── Original function pointers ────────────────────────────────────────────────
+typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)            (IDXGISwapChain*, UINT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateSC)           (IDXGIFactory*,   IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateSCForHwnd)    (IDXGIFactory2*,  IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateSCForCoreWin) (IDXGIFactory2*,  IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+
+static PFN_Present          oPresent         = nullptr;
+static PFN_CreateSC         oCreateSC        = nullptr;
+static PFN_CreateSCForHwnd  oCreateSCForHwnd = nullptr;
+
+// Factory vtable slots (IDXGIFactory)
+// CreateSwapChain is slot 10 on IDXGIFactory
+// IDXGIFactory2: CreateSwapChainForHwnd is slot 15
+static const int SLOT_CreateSwapChain        = 10;
+static const int SLOT_CreateSwapChainForHwnd = 15;
+static const int SLOT_Present                = 8;
+
+// ── Setup waitable object from a swapchain ────────────────────────────────────
+static void SetupWaitable(IDXGISwapChain* sc)
 {
-    HMONITOR hPrimary = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
-    MONITORINFOEXA mi = {}; mi.cbSize = sizeof(mi);
-    GetMonitorInfoA(hPrimary, &mi);
-    char primaryDev[64] = {};
-    strncpy_s(primaryDev, mi.szDevice, 63);
-    Logf("[AutoPacer v12] Primary: HMON=0x%p device='%s' rect=(%d,%d,%d,%d)",
-        (void*)hPrimary, primaryDev,
-        mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom);
+    if (g_WaitableActive) return; // already set up
 
-    IDXGIOutput* result = nullptr;
-
-    // Method A: factory enumeration
+    IDXGISwapChain2* sc2 = nullptr;
+    if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2)))
     {
-        IDXGIFactory1* factory = nullptr;
-        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory)))
+        HANDLE h = sc2->GetFrameLatencyWaitableObject();
+        if (h)
         {
-            for (UINT ai = 0; !result; ++ai)
-            {
-                IDXGIAdapter* adapter = nullptr;
-                if (FAILED(factory->EnumAdapters(ai, &adapter))) break;
-                DXGI_ADAPTER_DESC d = {}; adapter->GetDesc(&d);
-                char n[128] = {}; WideCharToMultiByte(CP_ACP, 0, d.Description, -1, n, 127, 0, 0);
-                Logf("[AutoPacer v12]   [A] Adapter %u: '%s' vendor=0x%04X", ai, n, d.VendorId);
-                bool isNV = (d.VendorId == 0x10DE) || strstr(n,"NVIDIA") || strstr(n,"GeForce");
-                bool isSW = strstr(n,"Microsoft") || strstr(n,"Basic Render");
-                if (!isNV && !isSW) {
-                    for (UINT oi = 0; ; ++oi) {
-                        IDXGIOutput* o = nullptr;
-                        if (FAILED(adapter->EnumOutputs(oi, &o))) break;
-                        DXGI_OUTPUT_DESC od = {}; o->GetDesc(&od);
-                        char dn[64] = {}; WideCharToMultiByte(CP_ACP, 0, od.DeviceName, -1, dn, 63, 0, 0);
-                        Logf("[AutoPacer v12]     Output %u: '%s' HMON=0x%p", oi, dn, (void*)od.Monitor);
-                        bool m = (_stricmp(dn, primaryDev)==0)||(od.Monitor==hPrimary)||
-                                 (od.DesktopCoordinates.left==mi.rcMonitor.left &&
-                                  od.DesktopCoordinates.top==mi.rcMonitor.top &&
-                                  od.DesktopCoordinates.right==mi.rcMonitor.right &&
-                                  od.DesktopCoordinates.bottom==mi.rcMonitor.bottom);
-                        if (m) { Logf("[AutoPacer v12]   MATCH A: %s out %u", n, oi); result=o; o=nullptr; }
-                        if (o) o->Release(); if (result) break;
-                    }
-                }
-                adapter->Release();
-            }
-            factory->Release();
+            // Set frame latency to 1 for minimum pipeline depth
+            HRESULT hr = sc2->SetMaximumFrameLatency(FRAME_LATENCY);
+            Logf("[AutoPacer v13] SetMaximumFrameLatency(%u): 0x%08X", FRAME_LATENCY, (unsigned)hr);
+
+            g_hWaitableObject = h;
+            g_WaitableActive  = true;
+            Log("[AutoPacer v13] Waitable object acquired - pipeline-synchronized mode ACTIVE");
         }
-    }
-
-    if (!result) {
-        Log("[AutoPacer v12] Method A empty, trying Method C (swapchain)...");
-        WNDCLASSEXA wc={}; wc.cbSize=sizeof(wc); wc.lpfnWndProc=DefWindowProcA;
-        wc.hInstance=GetModuleHandleA(nullptr); wc.lpszClassName="AP12_C";
-        RegisterClassExA(&wc);
-        HWND hw=CreateWindowExA(0,"AP12_C","",WS_POPUP,mi.rcMonitor.left,mi.rcMonitor.top,
-            8,8,nullptr,nullptr,wc.hInstance,nullptr);
-        DXGI_SWAP_CHAIN_DESC sd={}; sd.BufferCount=2;
-        sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
-        sd.BufferDesc.Width=sd.BufferDesc.Height=8;
-        sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE;
-        sd.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        D3D_FEATURE_LEVEL fl=D3D_FEATURE_LEVEL_11_0;
-        ID3D11Device* dev=nullptr; ID3D11DeviceContext* ctx=nullptr; IDXGISwapChain* sc=nullptr;
-        if (SUCCEEDED(D3D11CreateDeviceAndSwapChain(nullptr,D3D_DRIVER_TYPE_HARDWARE,
-            nullptr,0,&fl,1,D3D11_SDK_VERSION,&sd,&sc,&dev,nullptr,&ctx)) && sc)
-        {
-            IDXGIOutput* out=nullptr;
-            if (SUCCEEDED(sc->GetContainingOutput(&out)) && out) {
-                DXGI_OUTPUT_DESC od={}; out->GetDesc(&od);
-                char dn[64]={}; WideCharToMultiByte(CP_ACP,0,od.DeviceName,-1,dn,63,0,0);
-                Logf("[AutoPacer v12]   [C] GetContainingOutput: '%s' HMON=0x%p", dn, (void*)od.Monitor);
-                bool m=(_stricmp(dn,primaryDev)==0)||(od.Monitor==hPrimary)||
-                        (od.DesktopCoordinates.left==mi.rcMonitor.left && od.DesktopCoordinates.top==mi.rcMonitor.top);
-                if (m) { Log("[AutoPacer v12]   MATCH C"); result=out; out=nullptr; }
-                if (out) out->Release();
-            }
-            sc->Release(); dev->Release(); ctx->Release();
-        }
-        DestroyWindow(hw); UnregisterClassA("AP12_C", wc.hInstance);
-    }
-
-    if (!result) Log("[AutoPacer v12] ERROR: Could not find Intel output.");
-    return result;
-}
-
-// ── VBlank relay thread ───────────────────────────────────────────────────────
-// Calls WaitForVBlank on Intel's IDXGIOutput, timestamps each VBlank,
-// fires g_hVBlankEvent. Does NOT gate Present calls.
-static DWORD WINAPI VBlankThread(LPVOID)
-{
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    Log("[AutoPacer v12] VBlank thread started");
-    LONGLONG lastQPC = 0;
-    while (g_Running.load(std::memory_order_relaxed))
-    {
-        if (FAILED(g_IntelOutput->WaitForVBlank())) { Sleep(1); continue; }
-        LARGE_INTEGER now; QueryPerformanceCounter(&now);
-        LONGLONG qpc = now.QuadPart;
-        if (lastQPC > 0) {
-            LONGLONG period = qpc - lastQPC;
-            LONGLONG prev = g_VBlankPeriodQPC.load(std::memory_order_relaxed);
-            g_VBlankPeriodQPC.store(prev>0 ? (prev*7+period)/8 : period, std::memory_order_relaxed);
-        }
-        lastQPC = qpc;
-        g_LastVBlankQPC.store(qpc, std::memory_order_release);
-        SetEvent(g_hVBlankEvent);
-    }
-    return 0;
-}
-
-// ── Precision spinlock ────────────────────────────────────────────────────────
-static void SpinUntilQPC(LONGLONG targetQPC)
-{
-    LARGE_INTEGER now;
-    do { _mm_pause(); QueryPerformanceCounter(&now); } while (now.QuadPart < targetQPC);
-}
-
-// ── Get Intel scanout timing via DWM ─────────────────────────────────────────
-// DWM compositor runs on Intel, so its timing info reflects Intel's actual scanout.
-// Returns true and fills qpcLastVBlank / qpcRefreshPeriod if successful.
-static bool GetDWMTiming(LONGLONG* qpcLastVBlank, LONGLONG* qpcRefreshPeriod)
-{
-    if (!pfnDwmGetTimingInfo) return false;
-    DWM_TIMING_INFO ti = {}; ti.cbSize = sizeof(ti);
-    if (FAILED(pfnDwmGetTimingInfo(nullptr, &ti))) return false;
-    if (ti.qpcRefreshPeriod == 0) return false;
-    *qpcLastVBlank    = (LONGLONG)ti.qpcVBlank;
-    *qpcRefreshPeriod = (LONGLONG)ti.qpcRefreshPeriod;
-    return true;
-}
-
-// ── Core pacing: v12 model ────────────────────────────────────────────────────
-//
-// For normal frames (gap > BURST_THRESHOLD_NS): pass through immediately.
-//   VRR adapts naturally. ALLOW_TEARING preserved. No intervention.
-//
-// For burst frames (gap < BURST_THRESHOLD_NS, i.e. FG micro-burst):
-//   Get current scanout position from DWM timing (Intel-native).
-//   If we're in the safe zone (first SAFE_FRACTION of the refresh period after VBlank):
-//     -> Present now. We're right after VBlank, display just started a new scanout.
-//        Frame will be shown cleanly.
-//   If we're in the danger zone (active scanout, middle of the frame):
-//     -> Wait until the NEXT VBlank + safe zone offset.
-//     -> Present then. Frame lands at top of fresh scanout.
-//
-// ALLOW_TEARING is passed through unchanged. VRR stays fully active.
-//
-static void PaceFrame()
-{
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-
-    if (g_LastPresentQPC == 0) { g_LastPresentQPC = now.QuadPart; return; }
-
-    long long elapsedNs = (now.QuadPart - g_LastPresentQPC) * 1000000000LL / g_QPCFreq;
-
-    if (elapsedNs >= BURST_THRESHOLD_NS)
-    {
-        // Normal frame - zero intervention
-        g_LastPresentQPC = now.QuadPart;
-        return;
-    }
-
-    // ── Burst frame: need to land it in the safe zone ──────────────────────────
-
-    // Try DWM timing first (most accurate - Intel's own clock)
-    LONGLONG dwmLastVBlank = 0, dwmPeriod = 0;
-    bool hasDWM = GetDWMTiming(&dwmLastVBlank, &dwmPeriod);
-
-    // Fall back to VBlank thread measurements if DWM unavailable
-    LONGLONG lastVBlank = hasDWM ? dwmLastVBlank : g_LastVBlankQPC.load(std::memory_order_acquire);
-    LONGLONG period     = hasDWM ? dwmPeriod     : g_VBlankPeriodQPC.load(std::memory_order_relaxed);
-
-    if (period <= 0 || lastVBlank <= 0)
-    {
-        // No timing available yet - enforce minimum gap only
-        long long waitNs = BURST_THRESHOLD_NS - elapsedNs;
-        if (waitNs > 0)
-        {
-            LONGLONG targetQPC = g_LastPresentQPC + waitNs * g_QPCFreq / 1000000000LL;
-            SpinUntilQPC(targetQPC);
-        }
-        QueryPerformanceCounter(&now);
-        g_LastPresentQPC = now.QuadPart;
-        return;
-    }
-
-    // Calculate safe zone: first SAFE_FRACTION of the period after VBlank
-    LONGLONG safeZoneQPC = (LONGLONG)(period * SAFE_FRACTION);
-
-    // Where are we right now relative to the last VBlank?
-    QueryPerformanceCounter(&now);
-    LONGLONG sinceVBlankQPC = now.QuadPart - lastVBlank;
-
-    // Handle case where we're before the VBlank timestamp (clock jitter)
-    if (sinceVBlankQPC < 0) sinceVBlankQPC = 0;
-
-    // Normalize to current refresh period
-    if (sinceVBlankQPC >= period)
-        sinceVBlankQPC = sinceVBlankQPC % period;
-
-    bool inSafeZone = (sinceVBlankQPC < safeZoneQPC);
-
-    if (inSafeZone)
-    {
-        // We're right after a VBlank - safe to present now
-        g_LastPresentQPC = now.QuadPart;
-        return;
-    }
-
-    // We're in the danger zone. Wait for the next VBlank + safe zone offset.
-    LONGLONG qpcToNextVBlank = period - sinceVBlankQPC;
-    LONGLONG targetQPC = now.QuadPart + qpcToNextVBlank + safeZoneQPC / 2;
-
-    // Sanity cap: never wait more than 1.5 refresh periods (~9ms at 165Hz)
-    LONGLONG maxWaitQPC = now.QuadPart + (period * 3 / 2);
-    if (targetQPC > maxWaitQPC) targetQPC = maxWaitQPC;
-
-    // Wait efficiently: event-based until close, then spinlock for precision
-    LONGLONG remainQPC = targetQPC - now.QuadPart;
-    long long remainNs = remainQPC * 1000000000LL / g_QPCFreq;
-
-    if (remainNs > 1500000LL && g_hVBlankEvent)
-    {
-        // Sleep until next VBlank fires (efficient)
-        ResetEvent(g_hVBlankEvent);
-        // Re-read: did VBlank fire while we were resetting?
-        LONGLONG currentLastVBlank = g_LastVBlankQPC.load(std::memory_order_acquire);
-        if (currentLastVBlank == lastVBlank)
-        {
-            WaitForSingleObject(g_hVBlankEvent, 20); // timeout 20ms = 3 frames max
-        }
-        // VBlank fired. Spinlock to precise safe zone offset.
-        LONGLONG newVBlank = g_LastVBlankQPC.load(std::memory_order_acquire);
-        LONGLONG preciseTarget = newVBlank + safeZoneQPC / 2;
-        SpinUntilQPC(preciseTarget);
+        else Log("[AutoPacer v13] WARNING: GetFrameLatencyWaitableObject returned null");
+        sc2->Release();
     }
     else
     {
-        // Close to target - just spinlock
-        SpinUntilQPC(targetQPC);
+        // Swapchain doesn't support IDXGISwapChain2 - wasn't created with waitable flag
+        // This happens if the game uses DX12 or if our flag injection didn't work
+        Log("[AutoPacer v13] WARNING: IDXGISwapChain2 not available on game swapchain");
+        Log("[AutoPacer v13] Waitable mode unavailable - falling back to pass-through");
     }
-
-    QueryPerformanceCounter(&now);
-    g_LastPresentQPC = now.QuadPart;
 }
 
 // ── Hooked Present ────────────────────────────────────────────────────────────
@@ -344,122 +125,204 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
     if (g_FirstFrame)
     {
         g_FirstFrame = false;
-        Log("[AutoPacer v12] First frame - hook confirmed active");
-        // Log whether DWM timing is available
-        LONGLONG a=0, b=0;
-        bool dwm = GetDWMTiming(&a, &b);
-        Logf("[AutoPacer v12] DWM timing: %s (period=%.3fms)",
-            dwm ? "AVAILABLE" : "UNAVAILABLE",
-            dwm ? (b * 1000.0 / g_QPCFreq) : 0.0);
+        Log("[AutoPacer v13] First frame - hook confirmed active");
+        // Try to get waitable object if not already set up
+        // (in case the game's swapchain was created before our hook on CreateSwapChain fired)
+        if (!g_WaitableActive) SetupWaitable(pSC);
+        Logf("[AutoPacer v13] Waitable active: %s", g_WaitableActive ? "YES" : "NO");
         Beep(1000, 120);
     }
 
-    PaceFrame();
+    // Wait for Intel's pipeline to be ready for the next frame.
+    // This is the core mechanism: the waitable object fires when the display
+    // pipeline (Intel CASO path) has consumed the previous frame and is ready.
+    // With VRR active, this fires at whatever rate the display is running at.
+    if (g_WaitableActive && g_hWaitableObject)
+    {
+        DWORD waitResult = WaitForSingleObjectEx(g_hWaitableObject, WAITABLE_TIMEOUT_MS, FALSE);
+        if (waitResult == WAIT_TIMEOUT)
+        {
+            // Timeout - pipeline may be stalled. Present anyway to avoid deadlock.
+            Log("[AutoPacer v13] WARNING: Waitable timeout - presenting anyway");
+        }
+    }
 
-    // CRITICAL: pass SyncInterval and Flags through UNCHANGED.
-    // Do NOT strip DXGI_PRESENT_ALLOW_TEARING - that flag keeps VRR active.
-    // We handle the scanout timing ourselves; we don't need to disable VRR to do it.
+    // Pass everything through unchanged. ALLOW_TEARING preserved. VRR active.
     return oPresent(pSC, SyncInterval, Flags);
 }
 
-// ── Hook installation ─────────────────────────────────────────────────────────
-static bool InstallHook()
+// ── Hook Present on a swapchain ───────────────────────────────────────────────
+static void HookPresentOnSwapchain(IDXGISwapChain* sc)
 {
-    WNDCLASSEXA wc={}; wc.cbSize=sizeof(wc); wc.lpfnWndProc=DefWindowProcA;
-    wc.hInstance=GetModuleHandleA(nullptr); wc.lpszClassName="AP12_H";
-    RegisterClassExA(&wc);
-    HWND hw=CreateWindowExA(0,"AP12_H","",WS_POPUP,0,0,8,8,nullptr,nullptr,wc.hInstance,nullptr);
-
-    DXGI_SWAP_CHAIN_DESC sd={}; sd.BufferCount=2;
-    sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferDesc.Width=sd.BufferDesc.Height=8;
-    sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE;
-    sd.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
-
-    D3D_FEATURE_LEVEL fl=D3D_FEATURE_LEVEL_11_0;
-    ID3D11Device* dev=nullptr; ID3D11DeviceContext* ctx=nullptr; IDXGISwapChain* sc=nullptr;
-
-    HRESULT hr=D3D11CreateDeviceAndSwapChain(nullptr,D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,0,&fl,1,D3D11_SDK_VERSION,&sd,&sc,&dev,nullptr,&ctx);
-    if (FAILED(hr)||!sc)
-    {
-        Logf("[AutoPacer v12] Hook SC failed: 0x%08X", (unsigned)hr);
-        DestroyWindow(hw); UnregisterClassA("AP12_H", wc.hInstance);
-        return false;
-    }
-
-    void** vtable=*(void***)sc;
-    bool ok=PatchVTable(vtable, 8, (void*)HookedPresent, (void**)&oPresent);
-    sc->Release(); dev->Release(); ctx->Release();
-    DestroyWindow(hw); UnregisterClassA("AP12_H", wc.hInstance);
-
-    if (ok) Log("[AutoPacer v12] Present hook installed (slot 8)");
-    else    Log("[AutoPacer v12] ERROR: VTable patch failed");
-    return ok;
+    if (oPresent) return; // already hooked
+    void** vt = *(void***)sc;
+    if (PatchVTable(vt, SLOT_Present, (void*)HookedPresent, (void**)&oPresent))
+        Log("[AutoPacer v13] Present hook installed");
+    else
+        Log("[AutoPacer v13] ERROR: Present vtable patch failed");
 }
 
-// ── Init thread ───────────────────────────────────────────────────────────────
+// ── Hooked CreateSwapChain (IDXGIFactory, DX11 legacy path) ──────────────────
+static HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(
+    IDXGIFactory* pFactory, IUnknown* pDevice, HWND hWnd,
+    const DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain)
+{
+    Log("[AutoPacer v13] CreateSwapChain intercepted");
+
+    DXGI_SWAP_CHAIN_DESC desc = *pDesc;
+
+    // Only add waitable flag for flip model swapchains
+    // (DXGI_SWAP_EFFECT_FLIP_DISCARD or FLIP_SEQUENTIAL)
+    bool isFlip = (desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ||
+                   desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
+
+    if (isFlip)
+    {
+        desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        // Need at least 2 buffers for waitable
+        if (desc.BufferCount < 2) desc.BufferCount = 2;
+        Logf("[AutoPacer v13] Added WAITABLE flag (flip=%d, buffers=%u)", isFlip, desc.BufferCount);
+    }
+    else
+    {
+        Logf("[AutoPacer v13] Non-flip swapchain (SwapEffect=%u) - no waitable flag", desc.SwapEffect);
+    }
+
+    HRESULT hr = oCreateSC(pFactory, pDevice, hWnd, &desc, ppSwapChain);
+
+    if (SUCCEEDED(hr) && *ppSwapChain)
+    {
+        Logf("[AutoPacer v13] CreateSwapChain succeeded");
+        if (isFlip) SetupWaitable(*ppSwapChain);
+        HookPresentOnSwapchain(*ppSwapChain);
+    }
+    else
+    {
+        // If waitable flag caused failure, retry without it
+        if (isFlip && FAILED(hr))
+        {
+            Logf("[AutoPacer v13] Failed with waitable (0x%08X), retrying without...", (unsigned)hr);
+            hr = oCreateSC(pFactory, pDevice, hWnd, pDesc, ppSwapChain);
+            if (SUCCEEDED(hr) && *ppSwapChain)
+            {
+                Log("[AutoPacer v13] CreateSwapChain succeeded without waitable flag");
+                HookPresentOnSwapchain(*ppSwapChain);
+            }
+        }
+    }
+
+    return hr;
+}
+
+// ── Hooked CreateSwapChainForHwnd (IDXGIFactory2, DX11/DX12 modern path) ─────
+static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
+    IDXGIFactory2* pFactory, IUnknown* pDevice, HWND hWnd,
+    const DXGI_SWAP_CHAIN_DESC1* pDesc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
+    IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
+{
+    Log("[AutoPacer v13] CreateSwapChainForHwnd intercepted");
+
+    DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
+
+    bool isFlip = (desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ||
+                   desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
+
+    if (isFlip)
+    {
+        desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        if (desc.BufferCount < 2) desc.BufferCount = 2;
+        Logf("[AutoPacer v13] Added WAITABLE flag (flip=%d, buffers=%u, format=%u)",
+            isFlip, desc.BufferCount, desc.Format);
+    }
+
+    HRESULT hr = oCreateSCForHwnd(pFactory, pDevice, hWnd, &desc,
+                                   pFullscreenDesc, pRestrictToOutput, ppSwapChain);
+
+    if (SUCCEEDED(hr) && *ppSwapChain)
+    {
+        Logf("[AutoPacer v13] CreateSwapChainForHwnd succeeded");
+        if (isFlip) SetupWaitable(*ppSwapChain);
+        HookPresentOnSwapchain(*ppSwapChain);
+    }
+    else if (isFlip && FAILED(hr))
+    {
+        Logf("[AutoPacer v13] Failed with waitable (0x%08X), retrying without...", (unsigned)hr);
+        hr = oCreateSCForHwnd(pFactory, pDevice, hWnd, pDesc,
+                               pFullscreenDesc, pRestrictToOutput, ppSwapChain);
+        if (SUCCEEDED(hr) && *ppSwapChain)
+        {
+            Log("[AutoPacer v13] Succeeded without waitable");
+            HookPresentOnSwapchain(*ppSwapChain);
+        }
+    }
+
+    return hr;
+}
+
+// ── Hook factory vtable ───────────────────────────────────────────────────────
+static void HookFactory(IDXGIFactory* factory)
+{
+    void** vt = *(void***)factory;
+
+    if (!oCreateSC)
+    {
+        if (PatchVTable(vt, SLOT_CreateSwapChain, (void*)HookedCreateSwapChain, (void**)&oCreateSC))
+            Log("[AutoPacer v13] CreateSwapChain hook installed");
+        else
+            Log("[AutoPacer v13] ERROR: CreateSwapChain patch failed");
+    }
+
+    // Also hook IDXGIFactory2::CreateSwapChainForHwnd if available
+    IDXGIFactory2* factory2 = nullptr;
+    if (SUCCEEDED(factory->QueryInterface(__uuidof(IDXGIFactory2), (void**)&factory2)))
+    {
+        void** vt2 = *(void***)factory2;
+        if (!oCreateSCForHwnd)
+        {
+            if (PatchVTable(vt2, SLOT_CreateSwapChainForHwnd,
+                (void*)HookedCreateSwapChainForHwnd, (void**)&oCreateSCForHwnd))
+                Log("[AutoPacer v13] CreateSwapChainForHwnd hook installed");
+            else
+                Log("[AutoPacer v13] ERROR: CreateSwapChainForHwnd patch failed");
+        }
+        factory2->Release();
+    }
+}
+
+// ── Init: hook factory via CreateDXGIFactory ─────────────────────────────────
 static DWORD WINAPI InitThread(LPVOID)
 {
     while (!GetModuleHandleA("dxgi.dll")) Sleep(100);
-    Sleep(2000);
+    Sleep(1500); // let game load, then hook before it creates swapchain
 
-    Log("[AutoPacer v12] Initializing...");
+    Log("[AutoPacer v13] Initializing - hooking DXGI factory...");
 
-    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq); g_QPCFreq = freq.QuadPart;
-
-    // Load DWM timing function
-    HMODULE hDwm = LoadLibraryA("dwmapi.dll");
-    if (hDwm)
+    // Create a factory to get its vtable
+    IDXGIFactory1* factory = nullptr;
+    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory);
+    if (FAILED(hr) || !factory)
     {
-        pfnDwmGetTimingInfo = (PFN_DwmGetCompositionTimingInfo)
-            GetProcAddress(hDwm, "DwmGetCompositionTimingInfo");
-        Logf("[AutoPacer v12] DwmGetCompositionTimingInfo: %s",
-            pfnDwmGetTimingInfo ? "loaded" : "not found");
+        Logf("[AutoPacer v13] CreateDXGIFactory1 failed: 0x%08X", (unsigned)hr);
+        return 1;
     }
-    else Log("[AutoPacer v12] WARNING: dwmapi.dll not loaded");
 
-    g_IntelOutput = FindPrimaryOutput();
+    HookFactory(factory);
+    factory->Release();
 
-    if (g_IntelOutput)
-    {
-        g_hVBlankEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr); // auto-reset
-        if (g_hVBlankEvent)
-        {
-            g_Running.store(true);
-            g_hVBlankThread = CreateThread(nullptr, 0, VBlankThread, nullptr, 0, nullptr);
-        }
-    }
-    else Log("[AutoPacer v12] WARNING: Intel output not found. DWM-only timing mode.");
-
-    if (!InstallHook()) return 1;
-
-    bool hasFull = (g_IntelOutput && g_hVBlankEvent);
-    bool hasDWM  = (pfnDwmGetTimingInfo != nullptr);
-    Logf("[AutoPacer v12] Active mode: VBlank relay=%s, DWM timing=%s",
-        hasFull ? "YES" : "NO", hasDWM ? "YES" : "NO");
-    Logf("[AutoPacer v12] ALLOW_TEARING preserved: VRR stays ACTIVE");
-    Log("[AutoPacer v12] SUCCESS");
-    Beep(880, 200);
+    Log("[AutoPacer v13] Factory hooks installed. Waiting for game swapchain creation...");
+    Log("[AutoPacer v13] If game already created swapchain, Present hook will set up waitable on first frame.");
+    Beep(880, 150);
 
     return 0;
 }
 
-// ── DllMain ───────────────────────────────────────────────────────────────────
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hModule);
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
-    }
-    else if (reason == DLL_PROCESS_DETACH)
-    {
-        g_Running.store(false);
-        if (g_hVBlankEvent) { SetEvent(g_hVBlankEvent); CloseHandle(g_hVBlankEvent); }
-        if (g_hVBlankThread) { WaitForSingleObject(g_hVBlankThread, 2000); CloseHandle(g_hVBlankThread); }
-        if (g_IntelOutput) g_IntelOutput->Release();
     }
     return TRUE;
 }
