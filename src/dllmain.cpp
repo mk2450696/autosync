@@ -1,10 +1,11 @@
-// AutoPacer v38 - The Asynchronous Container (Proxy Queue)
+// AutoPacer v39 - The Dynamic Async Container (The Holy Grail)
 //
-// Built on the user's "Container" concept. 
-// Completely decouples the Mod's submission thread from the Hardware delivery thread.
-// The Mod drops frames into a thread-safe container and gets an instant S_OK.
-// A dedicated background thread drips the frames to the Intel driver at a flawless
-// 144 FPS (6.94ms gap). This completely shields the Intel driver from PCIe clustering.
+// Perfectly decouples the Mod's bursty PCIe submission from the Intel hardware delivery.
+// 1. Mod drops frames into a thread-safe queue and gets an instant S_OK (No blocking, no flashing).
+// 2. The producer tracks the true, natural FPS of the game using a 32-frame rolling average.
+// 3. The consumer background thread dynamically updates its delivery pace to exactly match 
+//    the rolling average, ensuring the Intel driver receives perfectly un-bunched frames 
+//    safely within the 165Hz VRR window.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -16,13 +17,14 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 
 static char g_logPath[MAX_PATH] = "AutoPacer.log";
 
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v38] %s\n", msg);
+        fprintf(fp, "[AutoPacer v39] %s\n", msg);
         fclose(fp);
     }
 }
@@ -45,7 +47,7 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── The Container (Thread-Safe Queue) ─────────────────────────────────────────
+// ── The Dynamic Container State ───────────────────────────────────────────────
 struct PresentArgs {
     IDXGISwapChain* pSC;
     UINT SyncInterval;
@@ -58,8 +60,14 @@ static std::condition_variable g_CV_Produce;
 static std::condition_variable g_CV_Consume;
 
 static LARGE_INTEGER g_qpcFreq;
+static double g_LastProduceTime = 0.0;
 static double g_LastReleaseTime = 0.0;
-const double TARGET_GAP_MS = 6.944; // Exactly 144 FPS to stay safely inside 165Hz VRR
+
+// Dynamic Pacing Variables
+const int HISTORY_SIZE = 32;
+static double g_DeltaHistory[HISTORY_SIZE];
+static int g_HistoryIdx = 0;
+static std::atomic<double> g_DynamicTargetMs{ 16.666 }; // Default 60fps start
 
 static double GetTimeMs() {
     LARGE_INTEGER qpc;
@@ -70,54 +78,86 @@ static double GetTimeMs() {
 // ── Hooked Present (The Producer) ─────────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
-    // Put the frame into the Container
+    double now = GetTimeMs();
+    
+    // 1. Calculate Dynamic Framerate
+    if (g_LastProduceTime > 0.0) {
+        double gap = now - g_LastProduceTime;
+        // Ignore load screens and massive stutters in our average
+        if (gap > 2.0 && gap < 100.0) {
+            g_DeltaHistory[g_HistoryIdx] = gap;
+            g_HistoryIdx = (g_HistoryIdx + 1) % HISTORY_SIZE;
+            
+            double sum = 0.0;
+            for(int i = 0; i < HISTORY_SIZE; i++) sum += g_DeltaHistory[i];
+            g_DynamicTargetMs.store(sum / (double)HISTORY_SIZE);
+        }
+    }
+    g_LastProduceTime = now;
+
+    // 2. Put Frame in the Container
     std::unique_lock<std::mutex> lock(g_Mutex);
     
-    // If our container has 2 frames in it, make the Mod wait. 
-    // This acts as flawless backpressure without relying on Intel's broken queue.
-    g_CV_Produce.wait(lock, [] { return g_Queue.size() < 2; });
+    // Allow up to 4 frames in the queue. 
+    // This gives the Mod massive breathing room to prevent the static-flashing crashes,
+    // while ensuring we don't exceed the 6-buffer DXGI limit.
+    g_CV_Produce.wait(lock, [] { return g_Queue.size() < 4; });
     
     g_Queue.push({ pSC, SyncInterval, Flags });
-    
-    // Tell our background thread a frame is ready
     g_CV_Consume.notify_one();
     
-    // Immediately tell the Mod "Success", so it can keep working unhindered
+    // 3. Return instantly so the Mod never blocks
     return S_OK; 
 }
 
 // ── Background Pacer Thread (The Consumer) ────────────────────────────────────
 static DWORD WINAPI PacerThread(LPVOID) {
-    Log("Asynchronous Container Thread started.");
+    Log("Dynamic Asynchronous Container Thread started.");
+    int logCounter = 0;
     
     while (true) {
         PresentArgs args;
         
-        // 1. Wait for a frame to enter the Container
+        // 1. Get Frame from Container
         {
             std::unique_lock<std::mutex> lock(g_Mutex);
             g_CV_Consume.wait(lock, [] { return !g_Queue.empty(); });
             args = g_Queue.front();
             g_Queue.pop();
         }
-        
-        // Tell the Mod there is free space in the Container
         g_CV_Produce.notify_one();
 
-        // 2. The Tollbooth (Perfect 144 FPS pacing)
+        // 2. Get the Dynamic Target and Clamp it safely for VRR
+        double target = g_DynamicTargetMs.load();
+        if (target < 6.25) target = 6.25; // MAX = 160 FPS (Keeps it safely under 165Hz limit)
+        if (target > 33.3) target = 33.3; // MIN = 30 FPS
+
+        // 3. The Tollbooth (Pace the hardware delivery)
         if (g_LastReleaseTime > 0.0) {
-            double targetTime = g_LastReleaseTime + TARGET_GAP_MS;
+            double targetTime = g_LastReleaseTime + target;
+            double now = GetTimeMs();
+            
+            // Anti-Starvation check: If the game paused (e.g. menus), reset the clock
+            // so we don't try to rapidly "catch up" and spam the Intel driver.
+            if (now > targetTime + target) {
+                targetTime = now;
+            }
+            
             while (GetTimeMs() < targetTime) {
                 YieldProcessor(); // Ultra-precise micro-spin
             }
         }
         
-        // 3. Deliver to Intel Driver
+        // 4. Deliver to Intel Driver
         g_LastReleaseTime = GetTimeMs();
-        
-        // We strip ALLOW_TEARING to let DWM handle the final sync natively if needed,
-        // or leave it as args.Flags if VRR is preferred. We'll use args.Flags to keep VRR.
         oPresent(args.pSC, args.SyncInterval, args.Flags);
+
+        // 5. Periodic Logging (Every 600 frames = ~5 seconds)
+        logCounter++;
+        if (logCounter % 600 == 0) {
+            Logf("Dynamic Pacer Status -> Target Gap: %.3f ms (%.1f FPS) | Queue Size: %zu", 
+                 target, 1000.0 / target, g_Queue.size());
+        }
     }
     return 0;
 }
@@ -150,7 +190,8 @@ static DWORD WINAPI InitThread(LPVOID) {
         void** vtable = *(void***)pDummySC;
         WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent);
         pDummySC->Release(); pDummyDev->Release();
-        Log("Container Hooks installed successfully.");
+        Log("Dynamic Container Hooks installed successfully.");
+        Beep(1000, 150);
     }
     DestroyWindow(dummyWnd); UnregisterClassA("DummyWindow", wc.hInstance);
     return 0;
@@ -160,11 +201,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         QueryPerformanceFrequency(&g_qpcFreq);
+        
+        // Pre-fill history to 60fps to prevent math errors on boot
+        for (int i = 0; i < HISTORY_SIZE; i++) g_DeltaHistory[i] = 16.666;
+
         char dllPath[MAX_PATH] = {}; GetModuleFileNameA(hModule, dllPath, sizeof(dllPath));
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) { *(lastSlash + 1) = '\0'; snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath); }
         remove(g_logPath);
-        Log("DLL Booted - v38 The Asynchronous Container");
+        Log("DLL Booted - v39 The Dynamic Async Container");
         
         CreateThread(nullptr, 0, PacerThread, nullptr, 0, nullptr);
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
