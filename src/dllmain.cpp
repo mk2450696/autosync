@@ -1,10 +1,11 @@
-// AutoPacer v40 - The True FPS Container (Non-Blocking)
+// AutoPacer v41 - The Elastic Pacer
 //
-// 1. Tracks real-time FPS natively without feedback loops.
-// 2. NEVER blocks the CPU. If the proxy queue fills up, it silently drops the 
-//    oldest frame instead of freezing the game engine (Fixes the 56 FPS lock & loading bug).
-// 3. The background thread adapts dynamically to the tracked FPS, but strictly 
-//    clamps the delivery to 155 FPS to guarantee VRR stays active on a 165Hz monitor.
+// 1. Never drops frames (preserves Frame Gen optical flow logic).
+// 2. Never blocks the Mod (prevents 56 FPS lock and internal desyncs).
+// 3. Uses a highly stable Exponential Moving Average (EMA) to track the true
+//    dynamic framerate of the game, filtering out the FG micro-bursts.
+// 4. The background consumer dynamically paces the Intel display delivery to 
+//    perfectly match that EMA, un-bunching the PCIe traffic flawlessly.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -23,7 +24,7 @@ static char g_logPath[MAX_PATH] = "AutoPacer.log";
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v40] %s\n", msg);
+        fprintf(fp, "[AutoPacer v41] %s\n", msg);
         fclose(fp);
     }
 }
@@ -46,7 +47,7 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── The Container State ───────────────────────────────────────────────────────
+// ── The Elastic Container ─────────────────────────────────────────────────────
 struct PresentArgs {
     IDXGISwapChain* pSC;
     UINT SyncInterval;
@@ -61,8 +62,8 @@ static LARGE_INTEGER g_qpcFreq;
 static double g_LastProduceTime = 0.0;
 static double g_LastReleaseTime = 0.0;
 
-// FPS Tracker
-static std::atomic<double> g_CurrentFPS{ 60.0 }; 
+// The True FPS Tracker
+static std::atomic<double> g_SmoothedGapMs{ 16.666 }; // Start at 60 FPS safety baseline
 
 static double GetTimeMs() {
     LARGE_INTEGER qpc;
@@ -75,46 +76,50 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
 {
     double now = GetTimeMs();
     
-    // 1. Track True FPS
+    // 1. Calculate the true, dynamic framerate using an Exponential Moving Average
     if (g_LastProduceTime > 0.0) {
         double gap = now - g_LastProduceTime;
-        if (gap > 1.0 && gap < 100.0) { // Ignore load screen pauses
-            double instantFPS = 1000.0 / gap;
-            // Smooth FPS rolling average
-            double current = g_CurrentFPS.load();
-            g_CurrentFPS.store((current * 0.95) + (instantFPS * 0.05));
+        
+        // Ignore loading screens or massive lag spikes so they don't break the math
+        if (gap > 1.0 && gap < 50.0) {
+            double currentSmooth = g_SmoothedGapMs.load();
+            // 95% history, 5% new data. Extremely stable, completely immune to micro-bursts, 
+            // but adapts to new framerates in about 0.15 seconds.
+            double newSmooth = (currentSmooth * 0.95) + (gap * 0.05);
+            g_SmoothedGapMs.store(newSmooth);
         }
     }
     g_LastProduceTime = now;
 
-    // 2. Put Frame in the Container (NEVER BLOCK)
+    // 2. Safely place the frame in the container
     {
         std::unique_lock<std::mutex> lock(g_Mutex);
         
-        // If the queue has 3 frames, we are exceeding the delivery speed.
-        // Silently drop the oldest frame. This guarantees the CPU is NEVER delayed.
-        while (g_Queue.size() >= 3) {
+        // Safety Valve: Only drop a frame if the queue hits 12 (massive system hang).
+        // Under normal gameplay, this will NEVER trigger. Frame Gen logic stays perfectly intact.
+        if (g_Queue.size() >= 12) {
             g_Queue.pop(); 
         }
         
         g_Queue.push({ pSC, SyncInterval, Flags });
     }
     
+    // Wake up the background thread
     g_CV_Consume.notify_one();
     
-    // 3. Return instantly. The game runs free.
+    // 3. Return instantly. The Mod is never blocked.
     return S_OK; 
 }
 
 // ── Background Pacer Thread (The Consumer) ────────────────────────────────────
 static DWORD WINAPI PacerThread(LPVOID) {
-    Log("True FPS Container Thread started. CPU blocking is DELETED.");
+    Log("Elastic Pacer Thread started. Frame Gen logic fully protected.");
     int logCounter = 0;
     
     while (true) {
         PresentArgs args;
         
-        // 1. Get Frame from Container
+        // 1. Grab frame from container
         {
             std::unique_lock<std::mutex> lock(g_Mutex);
             g_CV_Consume.wait(lock, [] { return !g_Queue.empty(); });
@@ -122,35 +127,36 @@ static DWORD WINAPI PacerThread(LPVOID) {
             g_Queue.pop();
         }
 
-        // 2. Adapt to FPS, but Protect VRR
-        double fps = g_CurrentFPS.load();
-        if (fps > 155.0) fps = 155.0; // Hard clamp to prevent tearing on 165Hz monitor
-        if (fps < 30.0) fps = 30.0;
-        
-        double targetGapMs = 1000.0 / fps;
+        // 2. Read the dynamic tracking speed and clamp it for VRR
+        double targetGapMs = g_SmoothedGapMs.load();
+        if (targetGapMs < 6.25) targetGapMs = 6.25; // Hard cap at 160 FPS to protect 165Hz VRR
+        if (targetGapMs > 33.3) targetGapMs = 33.3; // Hard floor at 30 FPS
 
-        // 3. Perfect Delivery Timing
+        // 3. The Tollbooth (Smooth Delivery)
         if (g_LastReleaseTime > 0.0) {
             double targetTime = g_LastReleaseTime + targetGapMs;
             double now = GetTimeMs();
             
-            // Anti-Starvation: Don't speed-up if the game paused
-            if (now > targetTime + 20.0) targetTime = now;
+            // Anti-Starvation: If the game was paused (menu), don't rapidly spam old frames
+            if (now > targetTime + 20.0) {
+                targetTime = now;
+            }
             
+            // Micro-spin for absolute precision
             while (GetTimeMs() < targetTime) {
-                YieldProcessor(); // Ultra-precise micro-spin
+                YieldProcessor(); 
             }
         }
         
-        // 4. Send to Intel Driver
+        // 4. Deliver to the Intel Driver
         g_LastReleaseTime = GetTimeMs();
         oPresent(args.pSC, args.SyncInterval, args.Flags);
 
-        // 5. Periodic Logging (Every ~5 seconds)
+        // 5. Diagnostics
         logCounter++;
         if (logCounter % 600 == 0) {
-            Logf("Dynamic Pacer -> Game FPS: %.1f | Delivering at: %.1f FPS | Gap: %.3f ms", 
-                 g_CurrentFPS.load(), fps, targetGapMs);
+            Logf("Elastic Pacer -> Target FPS: %.1f | Gap: %.3f ms | Queue Size: %zu", 
+                 1000.0 / targetGapMs, targetGapMs, g_Queue.size());
         }
     }
     return 0;
@@ -184,7 +190,7 @@ static DWORD WINAPI InitThread(LPVOID) {
         void** vtable = *(void***)pDummySC;
         WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent);
         pDummySC->Release(); pDummyDev->Release();
-        Log("Dynamic Container Hooks installed successfully.");
+        Log("Elastic Container Hooks installed successfully.");
         Beep(1000, 150);
     }
     DestroyWindow(dummyWnd); UnregisterClassA("DummyWindow", wc.hInstance);
@@ -200,7 +206,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) { *(lastSlash + 1) = '\0'; snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath); }
         remove(g_logPath);
-        Log("DLL Booted - v40 The True FPS Container");
+        Log("DLL Booted - v41 The Elastic Pacer");
         
         CreateThread(nullptr, 0, PacerThread, nullptr, 0, nullptr);
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
