@@ -208,6 +208,22 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(
     Logf("CreateSwapChain intercepted: SwapEffect=%s Flags=0x%X Buffers=%u",
         SwapEffectName(pDesc->SwapEffect), pDesc->Flags, pDesc->BufferCount);
 
+    // Sanity-check the desc before touching it.
+    // BufferCount >16 or Width/Height >16384 means we got a corrupt/internal call.
+    // Pass it through completely untouched to avoid crashing.
+    bool descSane = (pDesc->BufferCount <= 16 &&
+                     pDesc->BufferDesc.Width <= 16384 &&
+                     pDesc->BufferDesc.Height <= 16384);
+
+    if (!descSane)
+    {
+        Logf("  Desc looks corrupt (BufferCount=%u W=%u H=%u) - passing through untouched",
+            pDesc->BufferCount, pDesc->BufferDesc.Width, pDesc->BufferDesc.Height);
+        HRESULT hr2 = oCreateSC(pFactory, pDevice, hWnd, pDesc, ppSC);
+        if (SUCCEEDED(hr2) && *ppSC) HookPresent(*ppSC);
+        return hr2;
+    }
+
     DXGI_SWAP_CHAIN_DESC desc = *pDesc;
     bool upgraded = false;
 
@@ -216,9 +232,9 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(
         desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL)
     {
         desc.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        if (desc.BufferCount < 2) desc.BufferCount = 2;
+        desc.BufferCount = 2; // always force sane value when upgrading
         upgraded = true;
-        Log("  Upgraded BitBlt -> FLIP_DISCARD");
+        Log("  Upgraded BitBlt -> FLIP_DISCARD, BufferCount=2");
     }
 
     bool isFlip = (desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ||
@@ -271,6 +287,18 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
     Logf("CreateSwapChainForHwnd intercepted: SwapEffect=%s Flags=0x%X Buffers=%u",
         SwapEffectName(pDesc->SwapEffect), pDesc->Flags, pDesc->BufferCount);
 
+    bool descSane2 = (pDesc->BufferCount <= 16 &&
+                      pDesc->Width <= 16384 &&
+                      pDesc->Height <= 16384);
+    if (!descSane2)
+    {
+        Logf("  Desc corrupt (BufferCount=%u W=%u H=%u) - passing through untouched",
+            pDesc->BufferCount, pDesc->Width, pDesc->Height);
+        HRESULT hr2 = oCreateSCFHwnd(pFactory, pDevice, hWnd, pDesc, pFSD, pOutput, ppSC);
+        if (SUCCEEDED(hr2) && *ppSC) HookPresent(*ppSC);
+        return hr2;
+    }
+
     DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
     bool upgraded = false;
 
@@ -278,9 +306,9 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
         desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL)
     {
         desc.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        if (desc.BufferCount < 2) desc.BufferCount = 2;
+        desc.BufferCount = 2;
         upgraded = true;
-        Log("  Upgraded BitBlt -> FLIP_DISCARD");
+        Log("  Upgraded BitBlt -> FLIP_DISCARD, BufferCount=2");
     }
 
     bool isFlip = (desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ||
