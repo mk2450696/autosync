@@ -1,9 +1,9 @@
-// AutoPacer v25 - The Hardware Prober
+// AutoPacer v26 - The Answer Reader (Queue Saturation Telemetry)
 //
-// Based purely on the CSV data: the FG Mod deletes the DXGI_PRESENT_TEST (0x1) 
-// that the stock game uses to synchronize the Intel display queue over CASO.
-// This version intercepts the Mod's ALLOW_TEARING present and manually injects 
-// the 0x1 probe right before it, restoring the stock hardware behavior.
+// Injects the DXGI_PRESENT_TEST (0x1) and records the exact HRESULT (the answer) 
+// the Intel driver gives us, along with the VBlank monitor timings. 
+// This will prove if the Intel queue is returning DXGI_ERROR_WAS_STILL_DRAWING 
+// (queue full) right before the mod forces the frame and causes a stutter.
 
 #include <windows.h>
 #include <dxgi.h>
@@ -11,15 +11,43 @@
 #include <d3d11.h>
 #include <stdio.h>
 
+static char g_csvPath[MAX_PATH] = "AutoPacer_AnswerStats.csv";
 static char g_logPath[MAX_PATH] = "AutoPacer.log";
-static bool g_FirstFrame = true;
 
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v25] %s\n", msg);
+        fprintf(fp, "[AutoPacer v26] %s\n", msg);
         fclose(fp);
     }
+}
+
+// ── Telemetry State ───────────────────────────────────────────────────────────
+struct FrameRecord {
+    int frameNum;
+    void* swapchainPtr;
+    double cpuGapMs;
+    HRESULT testHr;
+    double testDurationMs;
+    HRESULT renderHr;
+    double renderDurationMs;
+    double dispGapMs;
+};
+
+const int MAX_FRAMES = 600;
+static FrameRecord g_Records[MAX_FRAMES];
+static int g_FrameCount = 0;
+static bool g_TelemetryDone = false;
+
+static bool g_FirstFrame = true;
+static LARGE_INTEGER g_qpcFreq;
+static double g_LastCpuTime = 0.0;
+static double g_LastDispTime = 0.0;
+
+static double GetTimeMs() {
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    return (double)(qpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
 }
 
 // ── VTable helpers ────────────────────────────────────────────────────────────
@@ -36,23 +64,66 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── Hooked Present (The 0x1 Injector) ─────────────────────────────────────────
+// ── Hooked Present (The Answer Reader) ────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
     if (g_FirstFrame) {
+        QueryPerformanceFrequency(&g_qpcFreq);
+        g_LastCpuTime = GetTimeMs();
         g_FirstFrame = false;
-        Log("First Present! Injecting DXGI_PRESENT_TEST (0x1) before frames.");
+        Log("Telemetry Started. Tracking Test Results and Hardware Queue.");
         Beep(1000, 100);
     }
 
-    // Only inject the test if the mod is actually trying to push a frame with ALLOW_TEARING
-    if (Flags & DXGI_PRESENT_ALLOW_TEARING) {
-        // Spoof the stock game's hardware probe: "Are you ready?"
-        // We use 0 for SyncInterval and 0x1 (DXGI_PRESENT_TEST) for the flag.
-        oPresent(pSC, 0, DXGI_PRESENT_TEST);
+    if (!g_TelemetryDone) {
+        double now = GetTimeMs();
+        double cpuGap = now - g_LastCpuTime;
+        g_LastCpuTime = now;
+
+        // 1. Inject the Hardware Probe (0x1) and record the driver's answer
+        double testStart = GetTimeMs();
+        HRESULT testHr = oPresent(pSC, 0, DXGI_PRESENT_TEST);
+        double testDuration = GetTimeMs() - testStart;
+
+        // 2. Read the Monitor's actual VBlank hardware timings
+        DXGI_FRAME_STATISTICS stats = {};
+        double dispGap = 0.0;
+        if (SUCCEEDED(pSC->GetFrameStatistics(&stats))) {
+            double dispTimeMs = (double)(stats.SyncQPCTime.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+            if (g_LastDispTime > 0.0 && stats.SyncQPCTime.QuadPart > 0) dispGap = dispTimeMs - g_LastDispTime;
+            if (stats.SyncQPCTime.QuadPart > 0) g_LastDispTime = dispTimeMs;
+        }
+
+        // 3. Do the actual render request that the Mod asked for
+        double renderStart = GetTimeMs();
+        HRESULT renderHr = oPresent(pSC, SyncInterval, Flags);
+        double renderDuration = GetTimeMs() - renderStart;
+
+        // Save to memory
+        if (g_FrameCount < MAX_FRAMES) {
+            g_Records[g_FrameCount] = { g_FrameCount, pSC, cpuGap, testHr, testDuration, renderHr, renderDuration, dispGap };
+            g_FrameCount++;
+        } 
+        else {
+            g_TelemetryDone = true;
+            FILE* fp;
+            if (fopen_s(&fp, g_csvPath, "w") == 0) {
+                fprintf(fp, "Frame,Swapchain,CpuGapMs,Test_HRESULT,Test_DurationMs,Render_HRESULT,Render_DurationMs,DispVBlankGapMs\n");
+                for (int i = 0; i < MAX_FRAMES; i++) {
+                    fprintf(fp, "%d,%p,%.3f,0x%08X,%.3f,0x%08X,%.3f,%.3f\n", 
+                        g_Records[i].frameNum, g_Records[i].swapchainPtr, g_Records[i].cpuGapMs,
+                        g_Records[i].testHr, g_Records[i].testDurationMs,
+                        g_Records[i].renderHr, g_Records[i].renderDurationMs,
+                        g_Records[i].dispGapMs);
+                }
+                fclose(fp);
+            }
+            Log("Telemetry complete. CSV written.");
+            Beep(1500, 200); // The second beep is back!
+        }
+        return renderHr;
     }
 
-    // Immediately pass the actual frame down the pipeline, just like the stock game does.
     return oPresent(pSC, SyncInterval, Flags);
 }
 
@@ -97,6 +168,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) {
             *(lastSlash + 1) = '\0';
+            snprintf(g_csvPath, sizeof(g_csvPath), "%sAutoPacer_AnswerStats.csv", dllPath);
             snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath);
         }
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
