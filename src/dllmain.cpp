@@ -1,30 +1,29 @@
-// AutoPacer v41 - The Elastic Pacer
+// AutoPacer v42 - The Flip-Sequential Restorer
 //
-// 1. Never drops frames (preserves Frame Gen optical flow logic).
-// 2. Never blocks the Mod (prevents 56 FPS lock and internal desyncs).
-// 3. Uses a highly stable Exponential Moving Average (EMA) to track the true
-//    dynamic framerate of the game, filtering out the FG micro-bursts.
-// 4. The background consumer dynamically paces the Intel display delivery to 
-//    perfectly match that EMA, un-bunching the PCIe traffic flawlessly.
+// Abandons broken async pacing which caused buffer-overwrite artifacts.
+// The true cause of CASO Frame Gen judder is the Mod using FLIP_DISCARD. 
+// When PCIe micro-bursts occur, FLIP_DISCARD tells Windows to throw the 
+// first frame in the trash (0.000ms gap), destroying the Frame Gen optical 
+// flow sequence.
+// By forcing DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, Windows is forced to display 
+// every single frame without dropping them, natively restoring the smooth 
+// visual sequence without needing any software CPU timers.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
-#include <d3d11.h>
+#include <dxgi1_6.h>
 #include <stdio.h>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
 
 static char g_logPath[MAX_PATH] = "AutoPacer.log";
+static bool g_FirstFrame = true;
 
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v41] %s\n", msg);
+        fprintf(fp, "[AutoPacer v42] %s\n", msg);
         fclose(fp);
     }
 }
@@ -43,128 +42,92 @@ static bool WritePtr(void** addr, void* newVal, void** oldVal) {
     return true;
 }
 
+// ── Function Pointers ─────────────────────────────────────────────────────────
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateSC)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateSCForHwnd)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
+
+static PFN_CreateSC oCreateSC = nullptr;
+static PFN_CreateSCForHwnd oCreateSCForHwnd = nullptr;
 static PFN_Present oPresent = nullptr;
+
 static const int SLOT_Present = 8;
+static const int SLOT_CreateSwapChain = 10;
+static const int SLOT_CreateSwapChainForHwnd = 15;
 
-// ── The Elastic Container ─────────────────────────────────────────────────────
-struct PresentArgs {
-    IDXGISwapChain* pSC;
-    UINT SyncInterval;
-    UINT Flags;
-};
+// ── Hooked CreateSwapChain ────────────────────────────────────────────────────
+static HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(
+    IDXGIFactory* pFactory, IUnknown* pDevice, 
+    DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSC)
+{
+    if (!pDesc) return oCreateSC(pFactory, pDevice, pDesc, ppSC);
 
-static std::queue<PresentArgs> g_Queue;
-static std::mutex g_Mutex;
-static std::condition_variable g_CV_Consume;
+    DXGI_SWAP_CHAIN_DESC newDesc = *pDesc;
 
-static LARGE_INTEGER g_qpcFreq;
-static double g_LastProduceTime = 0.0;
-static double g_LastReleaseTime = 0.0;
+    // If the Mod uses FLIP_DISCARD (4), force it to FLIP_SEQUENTIAL (3).
+    // We leave the BufferCount (6) and Flags (0x842) completely intact so it doesn't crash.
+    if (newDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD) {
+        Log("Intercepted CreateSwapChain! Changing SwapEffect to FLIP_SEQUENTIAL.");
+        newDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        Beep(800, 150);
+    }
 
-// The True FPS Tracker
-static std::atomic<double> g_SmoothedGapMs{ 16.666 }; // Start at 60 FPS safety baseline
-
-static double GetTimeMs() {
-    LARGE_INTEGER qpc;
-    QueryPerformanceCounter(&qpc);
-    return (double)(qpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+    return oCreateSC(pFactory, pDevice, &newDesc, ppSC);
 }
 
-// ── Hooked Present (The Non-Blocking Producer) ────────────────────────────────
+static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
+    IDXGIFactory2* pFactory, IUnknown* pDevice, HWND hWnd,
+    const DXGI_SWAP_CHAIN_DESC1* pDesc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFSD,
+    IDXGIOutput* pOutput, IDXGISwapChain1** ppSC)
+{
+    if (!pDesc) return oCreateSCForHwnd(pFactory, pDevice, hWnd, pDesc, pFSD, pOutput, ppSC);
+
+    DXGI_SWAP_CHAIN_DESC1 newDesc = *pDesc;
+
+    if (newDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD) {
+        Log("Intercepted CreateSwapChainForHwnd! Changing SwapEffect to FLIP_SEQUENTIAL.");
+        newDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        Beep(800, 150);
+    }
+
+    return oCreateSCForHwnd(pFactory, pDevice, hWnd, &newDesc, pFSD, pOutput, ppSC);
+}
+
+// ── Hooked Present (Just for Verification) ────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
-    double now = GetTimeMs();
-    
-    // 1. Calculate the true, dynamic framerate using an Exponential Moving Average
-    if (g_LastProduceTime > 0.0) {
-        double gap = now - g_LastProduceTime;
+    if (g_FirstFrame) {
+        g_FirstFrame = false;
         
-        // Ignore loading screens or massive lag spikes so they don't break the math
-        if (gap > 1.0 && gap < 50.0) {
-            double currentSmooth = g_SmoothedGapMs.load();
-            // 95% history, 5% new data. Extremely stable, completely immune to micro-bursts, 
-            // but adapts to new framerates in about 0.15 seconds.
-            double newSmooth = (currentSmooth * 0.95) + (gap * 0.05);
-            g_SmoothedGapMs.store(newSmooth);
+        DXGI_SWAP_CHAIN_DESC desc = {};
+        if (SUCCEEDED(pSC->GetDesc(&desc))) {
+            Log("=================================================");
+            Log("FIRST PRESENT VERIFICATION:");
+            Logf("Actual SwapEffect Running: %d (3 = FLIP_SEQUENTIAL, 4 = FLIP_DISCARD)", desc.SwapEffect);
+            Log("=================================================");
         }
+        Beep(1200, 200);
     }
-    g_LastProduceTime = now;
 
-    // 2. Safely place the frame in the container
-    {
-        std::unique_lock<std::mutex> lock(g_Mutex);
-        
-        // Safety Valve: Only drop a frame if the queue hits 12 (massive system hang).
-        // Under normal gameplay, this will NEVER trigger. Frame Gen logic stays perfectly intact.
-        if (g_Queue.size() >= 12) {
-            g_Queue.pop(); 
-        }
-        
-        g_Queue.push({ pSC, SyncInterval, Flags });
-    }
-    
-    // Wake up the background thread
-    g_CV_Consume.notify_one();
-    
-    // 3. Return instantly. The Mod is never blocked.
-    return S_OK; 
-}
-
-// ── Background Pacer Thread (The Consumer) ────────────────────────────────────
-static DWORD WINAPI PacerThread(LPVOID) {
-    Log("Elastic Pacer Thread started. Frame Gen logic fully protected.");
-    int logCounter = 0;
-    
-    while (true) {
-        PresentArgs args;
-        
-        // 1. Grab frame from container
-        {
-            std::unique_lock<std::mutex> lock(g_Mutex);
-            g_CV_Consume.wait(lock, [] { return !g_Queue.empty(); });
-            args = g_Queue.front();
-            g_Queue.pop();
-        }
-
-        // 2. Read the dynamic tracking speed and clamp it for VRR
-        double targetGapMs = g_SmoothedGapMs.load();
-        if (targetGapMs < 6.25) targetGapMs = 6.25; // Hard cap at 160 FPS to protect 165Hz VRR
-        if (targetGapMs > 33.3) targetGapMs = 33.3; // Hard floor at 30 FPS
-
-        // 3. The Tollbooth (Smooth Delivery)
-        if (g_LastReleaseTime > 0.0) {
-            double targetTime = g_LastReleaseTime + targetGapMs;
-            double now = GetTimeMs();
-            
-            // Anti-Starvation: If the game was paused (menu), don't rapidly spam old frames
-            if (now > targetTime + 20.0) {
-                targetTime = now;
-            }
-            
-            // Micro-spin for absolute precision
-            while (GetTimeMs() < targetTime) {
-                YieldProcessor(); 
-            }
-        }
-        
-        // 4. Deliver to the Intel Driver
-        g_LastReleaseTime = GetTimeMs();
-        oPresent(args.pSC, args.SyncInterval, args.Flags);
-
-        // 5. Diagnostics
-        logCounter++;
-        if (logCounter % 600 == 0) {
-            Logf("Elastic Pacer -> Target FPS: %.1f | Gap: %.3f ms | Queue Size: %zu", 
-                 1000.0 / targetGapMs, targetGapMs, g_Queue.size());
-        }
-    }
-    return 0;
+    return oPresent(pSC, SyncInterval, Flags);
 }
 
 // ── Init Thread ───────────────────────────────────────────────────────────────
 static DWORD WINAPI InitThread(LPVOID) {
     for (int i = 0; i < 200; ++i) { if (GetModuleHandleA("dxgi.dll")) break; Sleep(50); }
+    
+    // Hook Factory
+    IDXGIFactory2* pFactory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory2), (void**)&pFactory))) {
+        void** vtable = *(void***)pFactory;
+        WritePtr(&vtable[SLOT_CreateSwapChain], (void*)HookedCreateSwapChain, (void**)&oCreateSC);
+        WritePtr(&vtable[SLOT_CreateSwapChainForHwnd], (void*)HookedCreateSwapChainForHwnd, (void**)&oCreateSCForHwnd);
+        pFactory->Release();
+        Log("Factory hooks installed.");
+    }
+
+    // Wait for game window
     HWND gameWnd = nullptr;
     for (int i = 0; i < 600; ++i) {
         Sleep(50);
@@ -177,10 +140,10 @@ static DWORD WINAPI InitThread(LPVOID) {
     }
     Sleep(500);
 
+    // Hook Present
     WNDCLASSEXA wc = { sizeof(wc), CS_OWNDC, DefWindowProcA, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, "DummyWindow", nullptr };
     RegisterClassExA(&wc);
     HWND dummyWnd = CreateWindowA("DummyWindow", "Dummy", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
-
     DXGI_SWAP_CHAIN_DESC sd = {};
     sd.BufferCount = 1; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = dummyWnd; sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
@@ -190,25 +153,21 @@ static DWORD WINAPI InitThread(LPVOID) {
         void** vtable = *(void***)pDummySC;
         WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent);
         pDummySC->Release(); pDummyDev->Release();
-        Log("Elastic Container Hooks installed successfully.");
-        Beep(1000, 150);
     }
     DestroyWindow(dummyWnd); UnregisterClassA("DummyWindow", wc.hInstance);
+
+    Log("Waiting for Mod to create Swapchain...");
     return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        QueryPerformanceFrequency(&g_qpcFreq);
-        
         char dllPath[MAX_PATH] = {}; GetModuleFileNameA(hModule, dllPath, sizeof(dllPath));
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) { *(lastSlash + 1) = '\0'; snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath); }
         remove(g_logPath);
-        Log("DLL Booted - v41 The Elastic Pacer");
-        
-        CreateThread(nullptr, 0, PacerThread, nullptr, 0, nullptr);
+        Log("DLL Booted - v42 The Flip-Sequential Restorer");
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
     }
     return TRUE;
