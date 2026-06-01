@@ -1,21 +1,19 @@
-// AutoPacer v17 - Asynchronous Smart Pacer
+// AutoPacer v19 - Dynamic VRR Smoother (Software G-Sync Emulator)
 //
-// Hooks the real swapchain via the dummy vtable method (proven successful in v16).
-// Replaces the Waitable Object with a high-precision QPC (QueryPerformanceCounter)
-// time-spacer. It detects FG burst frames and spaces them exactly halfway between
-// the base frames, restoring smooth VRR cadence without adding base frame input lag.
+// Abandons static FPS limits. Instead, it maintains a real-time rolling average
+// of the game's actual framerate. It acts as a smart queue, catching burst frames
+// from FG mods and spacing them perfectly according to the current natural framerate.
+// This feeds a smooth, evenly-paced stream of frames to the Intel iGPU, allowing
+// VRR to function flawlessly at any framerate.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
-#include <dxgi1_6.h>
 #include <d3d11.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdarg.h>
-#include <atomic>
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 static CRITICAL_SECTION g_logCS;
@@ -24,14 +22,14 @@ static char             g_logPath[MAX_PATH] = "AutoPacer.log";
 
 static void Log(const char* msg)
 {
-    OutputDebugStringA("[AutoPacer v17] ");
+    OutputDebugStringA("[AutoPacer v19] ");
     OutputDebugStringA(msg);
     OutputDebugStringA("\n");
     if (!g_logCSInit) return;
     EnterCriticalSection(&g_logCS);
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v17] %s\n", msg);
+        fprintf(fp, "[AutoPacer v19] %s\n", msg);
         fclose(fp);
     }
     LeaveCriticalSection(&g_logCS);
@@ -42,15 +40,17 @@ static void Logf(const char* fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, a); va_end(a); Log(buf);
 }
 
-// ── State & Pacing Variables ──────────────────────────────────────────────────
-static std::atomic<bool> g_PresentHooked { false };
-static bool              g_FirstFrame    = true;
-
-// High Precision Timing
+// ── Dynamic Pacer State ───────────────────────────────────────────────────────
+static bool g_FirstFrame = true;
 static LARGE_INTEGER g_qpcFreq;
-static double        g_LastPresentTime = 0.0;
-static double        g_LastBaseTime    = 0.0;
-static double        g_BaseInterval    = 16.666; // Assume 60fps start
+
+// Rolling Average History (tracks the natural unpaced framerate)
+const int HISTORY_SIZE = 16;
+static double g_DeltaHistory[HISTORY_SIZE];
+static int g_HistoryIdx = 0;
+
+static double g_LastArriveTime  = 0.0;
+static double g_LastReleaseTime = 0.0;
 
 static double GetTimeMs()
 {
@@ -58,6 +58,9 @@ static double GetTimeMs()
     QueryPerformanceCounter(&qpc);
     return (double)(qpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
 }
+
+// WinMM timer resolution
+typedef MMRESULT(WINAPI* timeBeginPeriod_t)(UINT uPeriod);
 
 // ── VTable helpers ────────────────────────────────────────────────────────────
 static bool WritePtr(void** addr, void* newVal, void** oldVal)
@@ -74,54 +77,78 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── Hooked Present (The Smart Pacer) ──────────────────────────────────────────
+// ── Hooked Present (The Dynamic Smoother) ─────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
     if (g_FirstFrame)
     {
         QueryPerformanceFrequency(&g_qpcFreq);
-        g_LastPresentTime = GetTimeMs();
-        g_LastBaseTime = g_LastPresentTime;
-        g_FirstFrame = false;
         
-        Log("First Present intercepted! Smart Pacer is now active.");
+        HMODULE hWinMM = LoadLibraryA("winmm.dll");
+        if (hWinMM) {
+            auto tbp = (timeBeginPeriod_t)GetProcAddress(hWinMM, "timeBeginPeriod");
+            if (tbp) tbp(1); // 1ms sleep precision
+        }
+
+        double now = GetTimeMs();
+        g_LastArriveTime = now;
+        g_LastReleaseTime = now;
+
+        // Initialize history with a safe baseline (e.g., 60fps = 16.6ms)
+        for (int i = 0; i < HISTORY_SIZE; i++) {
+            g_DeltaHistory[i] = 16.666;
+        }
+
+        g_FirstFrame = false;
+        Log("First Present! Dynamic VRR Smoother Active.");
         Beep(1000, 120);
     }
 
-    double currentTime = GetTimeMs();
-    double timeSinceLast = currentTime - g_LastPresentTime;
+    double now = GetTimeMs();
+    
+    // 1. Measure the natural gap between frames arriving from the game/mod
+    double arrivalDelta = now - g_LastArriveTime;
+    g_LastArriveTime = now;
 
-    // Detect FG burst frames (arriving less than 3.5ms after the previous frame)
-    if (timeSinceLast < 3.5)
-    {
-        // Target time is exactly halfway between the last base frame and the expected next base frame
-        double targetTime = g_LastBaseTime + (g_BaseInterval / 2.0);
-        
-        // Safety clamp: don't delay more than 16ms to avoid aggressive stuttering
-        if (targetTime - currentTime > 16.0) targetTime = currentTime + 16.0;
-
-        // Spin-yield loop (ultra low latency, high precision wait)
-        while (GetTimeMs() < targetTime) {
-            YieldProcessor(); 
-        }
-
-        g_LastPresentTime = GetTimeMs();
-    }
-    else
-    {
-        // This is a normal Base Frame.
-        double currentBaseInterval = currentTime - g_LastBaseTime;
-        
-        // Smooth the average interval (clamp between 6ms and 33ms to ignore menu spikes/stutters)
-        if (currentBaseInterval > 6.0 && currentBaseInterval < 33.0) {
-            g_BaseInterval = (g_BaseInterval * 0.8) + (currentBaseInterval * 0.2);
-        }
-        
-        g_LastBaseTime = currentTime;
-        g_LastPresentTime = currentTime;
+    // Ignore massive load-screen spikes so they don't break the math
+    if (arrivalDelta > 5.0 && arrivalDelta < 100.0) {
+        g_DeltaHistory[g_HistoryIdx] = arrivalDelta;
+        g_HistoryIdx = (g_HistoryIdx + 1) % HISTORY_SIZE;
     }
 
-    // Call DLSS Enabler / Original Present
+    // 2. Calculate the dynamic average frametime of the game right now
+    double sum = 0.0;
+    for (int i = 0; i < HISTORY_SIZE; i++) sum += g_DeltaHistory[i];
+    double dynamicTargetInterval = sum / (double)HISTORY_SIZE;
+
+    // 3. Determine exactly when this frame SHOULD be released to the monitor
+    double targetReleaseTime = g_LastReleaseTime + dynamicTargetInterval;
+
+    // Safety net: If the game naturally lagged, don't delay it further
+    if (now >= targetReleaseTime) {
+        targetReleaseTime = now;
+    }
+    // Safety net: Never delay a frame by more than 20ms to prevent game engine freezing
+    else if (targetReleaseTime - now > 20.0) {
+        targetReleaseTime = now + 20.0;
+    }
+
+    // 4. Smooth Queue: Hold the burst frame until its perfect dynamic timeslot
+    if (now < targetReleaseTime) {
+        while (true) {
+            double t = GetTimeMs();
+            if (t >= targetReleaseTime) break;
+            
+            if (targetReleaseTime - t > 2.0) {
+                Sleep(1); // Give CPU back to the Frame Gen mod
+            } else {
+                YieldProcessor(); // Micro-spin for exact millisecond precision
+            }
+        }
+    }
+
+    // 5. Release to the screen!
+    g_LastReleaseTime = GetTimeMs();
     return oPresent(pSC, SyncInterval, Flags);
 }
 
@@ -133,7 +160,6 @@ static DWORD WINAPI InitThread(LPVOID)
         Sleep(50);
     }
     if (!GetModuleHandleA("dxgi.dll")) { Log("ERROR: dxgi.dll never loaded"); return 1; }
-    Log("dxgi.dll present");
 
     HWND gameWnd = nullptr;
     for (int i = 0; i < 600; ++i)
@@ -187,7 +213,6 @@ static DWORD WINAPI InitThread(LPVOID)
         if (WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent))
         {
             Logf("SUCCESS: Present chain wrap installed! Slot 8 was: %p", oPresent);
-            g_PresentHooked = true;
         }
         else Log("ERROR: VTable write failed.");
 
@@ -220,7 +245,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath);
         }
 
-        Log("DLL loaded - v17 Smart Pacer approach");
+        Log("DLL loaded - v19 Dynamic VRR Smoother");
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
     }
     else if (reason == DLL_PROCESS_DETACH)
