@@ -1,8 +1,10 @@
-// AutoPacer v21 - Telemetry Edition
+// AutoPacer v23 - Display Hardware Telemetry
 //
-// Does no pacing. Injects a diagnostic wiretap to record the exact arrival gaps, 
-// execution duration, and DXGI flags of the first 600 frames. 
-// Dumps to a CSV file for analysis to find the actual root cause of the tearing.
+// ZERO pacing. ZERO flag modification. 
+// This tracks both the CPU Present time AND the actual Hardware VBlank time 
+// (when the frame physically hits the monitor). 
+// By comparing the two, we can prove if the Nvidia->Intel cross-adapter copy 
+// is destroying the FSR3 pacing logic and causing VRR thrashing.
 
 #include <windows.h>
 #include <dxgi.h>
@@ -10,13 +12,13 @@
 #include <d3d11.h>
 #include <stdio.h>
 
-static char g_csvPath[MAX_PATH] = "AutoPacer_Telemetry.csv";
+static char g_csvPath[MAX_PATH] = "AutoPacer_HardwareStats.csv";
 static char g_logPath[MAX_PATH] = "AutoPacer.log";
 
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v21] %s\n", msg);
+        fprintf(fp, "[AutoPacer v23] %s\n", msg);
         fclose(fp);
     }
 }
@@ -24,10 +26,9 @@ static void Log(const char* msg) {
 // ── Telemetry State ───────────────────────────────────────────────────────────
 struct FrameRecord {
     int frameNum;
-    double arrivalGapMs;
-    double presentDurationMs;
-    UINT syncInterval;
-    UINT flags;
+    double cpuPresentGapMs;
+    double displayVBlankGapMs;
+    UINT syncRefreshCount;
 };
 
 const int MAX_FRAMES = 600;
@@ -37,7 +38,8 @@ static bool g_TelemetryDone = false;
 
 static bool g_FirstFrame = true;
 static LARGE_INTEGER g_qpcFreq;
-static double g_LastArrivalTime = 0.0;
+static double g_LastCpuTime = 0.0;
+static double g_LastDisplayTime = 0.0;
 
 static double GetTimeMs() {
     LARGE_INTEGER qpc;
@@ -59,60 +61,64 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── Hooked Present (The Wiretap) ──────────────────────────────────────────────
+// ── Hooked Present (Hardware Wiretap) ─────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
     if (g_FirstFrame) {
         QueryPerformanceFrequency(&g_qpcFreq);
-        g_LastArrivalTime = GetTimeMs();
+        g_LastCpuTime = GetTimeMs();
         g_FirstFrame = false;
-        
-        // Log Swapchain configuration on the very first frame
-        DXGI_SWAP_CHAIN_DESC desc;
-        if (SUCCEEDED(pSC->GetDesc(&desc))) {
-            char config[256];
-            sprintf_s(config, "Swapchain -> Buffers: %u | SwapEffect: %u | Flags: 0x%X", 
-                desc.BufferCount, desc.SwapEffect, desc.Flags);
-            Log(config);
-        }
+        Log("Telemetry Started. Tracking CPU vs Display timings.");
         Beep(1000, 100);
     }
 
     if (!g_TelemetryDone) {
         double now = GetTimeMs();
-        double gap = now - g_LastArrivalTime;
-        g_LastArrivalTime = now;
+        double cpuGap = now - g_LastCpuTime;
+        g_LastCpuTime = now;
 
-        // Measure how long the original Present takes to execute
-        double startPresent = GetTimeMs();
+        // Ask the display driver for the stats of the PREVIOUS frames that actually hit the screen
+        DXGI_FRAME_STATISTICS stats = {};
+        double displayGap = 0.0;
+        UINT refreshCount = 0;
+
+        if (SUCCEEDED(pSC->GetFrameStatistics(&stats))) {
+            double displayTimeMs = (double)(stats.SyncQPCTime.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+            if (g_LastDisplayTime > 0.0 && stats.SyncQPCTime.QuadPart > 0) {
+                displayGap = displayTimeMs - g_LastDisplayTime;
+            }
+            if (stats.SyncQPCTime.QuadPart > 0) {
+                g_LastDisplayTime = displayTimeMs;
+            }
+            refreshCount = stats.SyncRefreshCount;
+        }
+
+        // Call original Present perfectly untouched
         HRESULT hr = oPresent(pSC, SyncInterval, Flags);
-        double presentDuration = GetTimeMs() - startPresent;
 
         // Save to memory
         if (g_FrameCount < MAX_FRAMES) {
-            g_Records[g_FrameCount] = { g_FrameCount, gap, presentDuration, SyncInterval, Flags };
+            g_Records[g_FrameCount] = { g_FrameCount, cpuGap, displayGap, refreshCount };
             g_FrameCount++;
         } 
         else {
             g_TelemetryDone = true;
-            // Write to CSV once done
             FILE* fp;
             if (fopen_s(&fp, g_csvPath, "w") == 0) {
-                fprintf(fp, "Frame,ArrivalGapMs,PresentDurationMs,SyncInterval,Flags\n");
+                fprintf(fp, "Frame,CpuPresentGapMs,DisplayVBlankGapMs,SyncRefreshCount\n");
                 for (int i = 0; i < MAX_FRAMES; i++) {
-                    fprintf(fp, "%d,%.3f,%.3f,%u,0x%X\n", 
-                        g_Records[i].frameNum, g_Records[i].arrivalGapMs, 
-                        g_Records[i].presentDurationMs, g_Records[i].syncInterval, g_Records[i].flags);
+                    fprintf(fp, "%d,%.3f,%.3f,%u\n", 
+                        g_Records[i].frameNum, g_Records[i].cpuPresentGapMs, 
+                        g_Records[i].displayVBlankGapMs, g_Records[i].syncRefreshCount);
                 }
                 fclose(fp);
             }
             Log("Telemetry complete. CSV written.");
-            Beep(1500, 200); // High beep indicates telemetry finished
+            Beep(1500, 200);
         }
         return hr;
     }
 
-    // After 600 frames, just pass through natively with no tracking overhead
     return oPresent(pSC, SyncInterval, Flags);
 }
 
@@ -157,7 +163,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) {
             *(lastSlash + 1) = '\0';
-            snprintf(g_csvPath, sizeof(g_csvPath), "%sAutoPacer_Telemetry.csv", dllPath);
+            snprintf(g_csvPath, sizeof(g_csvPath), "%sAutoPacer_HardwareStats.csv", dllPath);
             snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath);
         }
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
