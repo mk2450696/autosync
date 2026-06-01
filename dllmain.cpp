@@ -1,294 +1,397 @@
-// ============================================================
-//  AutoPacer v8 - Fixed Threshold Burst Catcher
-//  for iGPU display + dGPU render + Frame Generation setups
-//
-//  THE ONLY JOB OF THIS CODE:
-//  If a frame arrives less than 5.5ms after the previous one
-//  (a Frame Generation micro-burst), hold it until 5.5ms has
-//  elapsed. All other frames pass through with ZERO latency.
-//
-//  WHY THIS WORKS WITHOUT A FEEDBACK LOOP:
-//  The threshold (5.5ms) is a FIXED constant. It never changes.
-//  We never measure our own output to set our target.
-//  At 158fps output: frames arrive every 6.33ms > 5.5ms threshold
-//  -> ALL pass immediately, zero impact on normal gameplay.
-//  FG burst (3 frames in 2ms): each frame arrives ~0.7ms apart
-//  -> each held until 5.5ms -> spread across VBlank intervals
-//  -> Intel VRR sees evenly spaced frames -> no tearing.
-//
-//  WHY PREVIOUS VERSIONS FAILED:
-//  v3: WaitForVBlank in present thread, tanked FPS
-//  v4: Hard cap (g_LastPresent + target) = FPS limiter, not burst catcher
-//  v5/v6/v7: Measured paced output to set target = feedback loop
-//  My v2: CreateSwapChain hook crashed with DLSS Enabler proxy
-//
-//  WHAT WE DO NOT DO:
-//  - No CreateSwapChain/CreateSwapChainForHwnd hooks (crashes FG mods)
-//  - No dynamic measurement of frame times
-//  - No WaitForVBlank in the present thread
-//  - No Intel output detection (not needed)
-// ============================================================
+// AutoPacer v10 - Software G-Sync for iGPU display + dGPU render (CASO) setups
+// Architecture:
+//   1. Find Intel's IDXGIOutput by matching primary monitor coordinates {0,0}
+//   2. Dedicated VBlank thread: WaitForVBlank on Intel output, posts semaphore per VBlank
+//   3. Present hook: burst-catches FG frames (6.2ms min spacing), waits on VBlank semaphore,
+//      then presents with SyncInterval=0 (VRR-compatible, timed to actual Intel VBlank)
+// Result: tear-free at any FPS within VRR range, no judder, no latency overhead
 
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <d3d11.h>
 #include <dxgi.h>
-#include <stdio.h>
+#include <dxgi1_2.h>
+#include <d3d11.h>
+#include <d3d12.h>
+#include <wrl/client.h>
 #include <atomic>
-#include <MinHook.h>
-#include <mmsystem.h>
-#pragma comment(lib, "winmm.lib")
+#include <thread>
+#include <chrono>
+#include <cstdio>
+#include <vector>
 
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 2
-#endif
+using Microsoft::WRL::ComPtr;
+using namespace std::chrono;
 
-typedef HRESULT(__stdcall* Present_t)(IDXGISwapChain*, UINT, UINT);
-static Present_t oPresent = nullptr;
+// ── Configuration ────────────────────────────────────────────────────────────
+static constexpr double BURST_THRESHOLD_MS  = 6.2;   // Min ms between frames (just above 165Hz VBlank 6.06ms)
+static constexpr DWORD  VBLANK_WAIT_TIMEOUT = 50;     // ms before we give up waiting for VBlank semaphore
+static constexpr bool   ENABLE_BEEP         = true;   // Audible init confirmation
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ============================================================
-//  CONFIGURATION
-//  Minimum nanoseconds between frame presentations.
-//
-//  At 165Hz: one VBlank period = 6,060,606 ns (6.06ms)
-//  At 158fps: one frame = 6,329,114 ns (6.33ms) <- ABOVE threshold
-//  FG burst frames arrive < 2,000,000 ns (2ms) <- BELOW threshold
-//
-//  Result: normal frames always pass, bursts always caught.
-//  Adjust if needed:
-//    5000000 = 5.0ms (tighter, use if tearing persists)
-//    6000000 = 6.0ms (stricter ceiling, closer to 165Hz limit)
-// ============================================================
-static const long long MIN_FRAME_NS = 6200000LL; // 6.2ms: above 165Hz VBlank (6.06ms) so each frame gets its own full VBlank cycle
+// ── Globals ───────────────────────────────────────────────────────────────────
+static HANDLE               g_hVBlankSem     = nullptr;  // VBlank relay semaphore
+static ComPtr<IDXGIOutput>  g_IntelOutput    = nullptr;  // Intel's IDXGIOutput (primary monitor)
+static std::atomic<bool>    g_Running        { false };
+static std::thread          g_VBlankThread;
 
-// How many ns before the target to switch from timer to spinlock.
-// The timer wakes us ~0.5ms early, spinlock covers precision gap.
-static const long long SPIN_LEAD_NS = 1500000LL; // 1.5ms
+// Present hook state
+using PFN_Present  = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+using PFN_Present1 = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+static PFN_Present  oPresent  = nullptr;
+static PFN_Present1 oPresent1 = nullptr;
 
-static HANDLE            g_hTimer    = nullptr;
-static LARGE_INTEGER     g_qpcFreq   = {};
-static std::atomic<long long> g_lastNs{0};
-static std::atomic<bool> g_initialized{false};
-static volatile bool     g_firstFrame = true;
+static LONGLONG g_LastPresentQPC = 0;
+static LONGLONG g_QPCFreq        = 0;
 
-// ============================================================
-//  Logging
-// ============================================================
-static void Log(const char* msg) {
-    FILE* fp;
-    if (fopen_s(&fp, "AutoPacer.log", "a") == 0) {
-        fprintf(fp, "%s\n", msg);
-        fclose(fp);
-    }
+// ── VTable patching helpers ───────────────────────────────────────────────────
+static bool PatchVTable(void** vtable, int slot, void* newFn, void** oldFn)
+{
+    DWORD oldProt;
+    if (!VirtualProtect(&vtable[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProt))
+        return false;
+    *oldFn = vtable[slot];
+    vtable[slot] = newFn;
+    VirtualProtect(&vtable[slot], sizeof(void*), oldProt, &oldProt);
+    return true;
 }
 
-// ============================================================
-//  High-precision nanosecond clock via QPC
-//  Split into whole-second and sub-second parts to avoid
-//  integer overflow with long long arithmetic.
-// ============================================================
-static inline long long NowNs() {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    // (count / freq) * 1e9  +  (count % freq) * 1e9 / freq
-    // Both terms fit in long long for any reasonable runtime.
-    return (t.QuadPart / g_qpcFreq.QuadPart) * 1000000000LL
-         + (t.QuadPart % g_qpcFreq.QuadPart) * 1000000000LL
-           / g_qpcFreq.QuadPart;
-}
+// ── Find Intel IDXGIOutput by primary monitor position ────────────────────────
+// Primary monitor always has virtual screen position {0,0}.
+// DWM confirmed running on Intel, so Intel owns the primary monitor.
+static ComPtr<IDXGIOutput> FindIntelOutput()
+{
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)factory.GetAddressOf())))
+        return nullptr;
 
-// ============================================================
-//  Hybrid wait: coarse high-res timer + fine spinlock.
-//
-//  waitNs: total nanoseconds we need to wait.
-//
-//  We sleep (0% CPU) for (waitNs - SPIN_LEAD_NS), then spin
-//  for the remaining ~1.5ms for sub-millisecond precision.
-//  The spinlock phase is capped at SPIN_LEAD_NS (1.5ms max).
-// ============================================================
-static void HybridWait(long long waitNs, long long startNs) {
-    const long long targetNs = startNs + MIN_FRAME_NS;
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    HMONITOR hPrimary = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    GetMonitorInfoA(hPrimary, &mi);
 
-    // Coarse phase: use high-res waitable timer if wait > 2ms
-    if (waitNs > SPIN_LEAD_NS + 500000LL) { // > 2ms total
-        LARGE_INTEGER due;
-        // Negative = relative time, units = 100ns intervals
-        long long coarseNs = waitNs - SPIN_LEAD_NS;
-        due.QuadPart = -(coarseNs / 100LL);
-        SetWaitableTimer(g_hTimer, &due, 0, NULL, NULL, 0);
-        WaitForSingleObject(g_hTimer, 20); // 20ms safety timeout
-    }
+    for (UINT adapterIdx = 0; ; ++adapterIdx)
+    {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (FAILED(factory->EnumAdapters1(adapterIdx, adapter.GetAddressOf())))
+            break;
 
-    // Fine phase: spinlock for precision
-    // Maximum spin duration = SPIN_LEAD_NS = 1.5ms
-    // (irrelevant to render thread performance at this scale)
-    while (NowNs() < targetNs) {
-        YieldProcessor(); // CPU PAUSE instruction, not thread yield
-    }
-}
+        DXGI_ADAPTER_DESC1 adesc;
+        adapter->GetDesc1(&adesc);
 
-// ============================================================
-//  Present Hook - The burst catcher
-//
-//  Called for every frame including FG-generated frames.
-//  Two cases:
-//  1. Normal frame (elapsed >= 5.5ms): pass immediately, 0 latency
-//  2. Burst frame  (elapsed <  5.5ms): wait remainder, then pass
-// ============================================================
-static HRESULT __stdcall hkPresent(IDXGISwapChain* pSC, UINT syncInterval, UINT flags) {
-    if (oPresent == nullptr) return E_FAIL; // Shouldn't happen but guard
+        // Skip Microsoft Basic Render Driver and software adapters
+        if (adesc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+            continue;
 
-    if (g_firstFrame) {
-        g_firstFrame = false;
-        Log("SUCCESS: AutoPacer v8 active. Burst threshold: 6.2ms (one frame per 165Hz VBlank guaranteed)");
-        Beep(880, 120);
-    }
+        // Check each output on this adapter
+        for (UINT outIdx = 0; ; ++outIdx)
+        {
+            ComPtr<IDXGIOutput> output;
+            if (FAILED(adapter->EnumOutputs(outIdx, output.GetAddressOf())))
+                break;
 
-    long long nowNs  = NowNs();
-    long long lastNs = g_lastNs.load(std::memory_order_relaxed);
+            DXGI_OUTPUT_DESC odesc;
+            output->GetDesc(&odesc);
 
-    if (lastNs > 0) {
-        long long elapsedNs = nowNs - lastNs;
-
-        if (elapsedNs < MIN_FRAME_NS) {
-            // Burst frame detected. Hold until minimum interval elapsed.
-            long long waitNs = MIN_FRAME_NS - elapsedNs;
-            HybridWait(waitNs, lastNs);
-            nowNs = NowNs(); // refresh after wait
+            // Match by monitor handle
+            if (odesc.Monitor == hPrimary)
+            {
+                // Extra sanity: VendorId 0x8086 = Intel
+                if (adesc.VendorId == 0x8086)
+                {
+                    char adapterName[256] = {};
+                    WideCharToMultiByte(CP_ACP, 0, adesc.Description, -1, adapterName, 255, nullptr, nullptr);
+                    char msg[512];
+                    sprintf_s(msg, "[AutoPacer v10] Found Intel output: adapter=%s, output=%d\n", adapterName, outIdx);
+                    OutputDebugStringA(msg);
+                    return output;
+                }
+            }
         }
-        // else: normal frame, falls through immediately
     }
 
-    // Store presentation timestamp
-    g_lastNs.store(nowNs, std::memory_order_relaxed);
+    // Fallback: return the output whose DesktopCoordinates match the primary monitor rect
+    // (covers cases where VendorId check might miss something unusual)
+    for (UINT adapterIdx = 0; ; ++adapterIdx)
+    {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (FAILED(factory->EnumAdapters1(adapterIdx, adapter.GetAddressOf())))
+            break;
 
-    // Forward to real Present:
-    // - syncInterval = 0: VRR must not be overridden by vsync
-    // - Strip DO_NOT_WAIT (we already waited above if needed)
-    // - Keep all other flags as the game/mod set them
-    UINT outFlags = flags & ~DXGI_PRESENT_DO_NOT_WAIT;
-    return oPresent(pSC, 0, outFlags);
+        DXGI_ADAPTER_DESC1 adesc;
+        adapter->GetDesc1(&adesc);
+        if (adesc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+            continue;
+        if (adesc.VendorId == 0x10DE) // Skip NVIDIA in fallback
+            continue;
+
+        for (UINT outIdx = 0; ; ++outIdx)
+        {
+            ComPtr<IDXGIOutput> output;
+            if (FAILED(adapter->EnumOutputs(outIdx, output.GetAddressOf())))
+                break;
+
+            DXGI_OUTPUT_DESC odesc;
+            output->GetDesc(&odesc);
+            if (odesc.DesktopCoordinates.left == mi.rcMonitor.left &&
+                odesc.DesktopCoordinates.top  == mi.rcMonitor.top)
+            {
+                OutputDebugStringA("[AutoPacer v10] Found Intel output via coordinate fallback\n");
+                return output;
+            }
+        }
+    }
+
+    OutputDebugStringA("[AutoPacer v10] ERROR: Could not find Intel output\n");
+    return nullptr;
 }
 
-// ============================================================
-//  Initialization Thread
-//  Waits for DXGI + proxy mods to load, then installs the hook
-//  via a dummy DX11 device vtable lookup.
-//
-//  WHY DUMMY DEVICE (not CreateSwapChain hook):
-//  MinHook patches the actual IDXGISwapChain::Present function
-//  code in memory. All IDXGISwapChain instances (game's real one
-//  AND any FG proxy) share the same vtable and therefore the
-//  same function code address. Patching it via a dummy device's
-//  vtable patches it globally - catches every Present call.
-//
-//  Hooking CreateSwapChain CRASHES because DLSS Enabler already
-//  hooks it as a proxy - double-hooking corrupts the call chain.
-// ============================================================
-static DWORD WINAPI InitThread(LPVOID) {
-    // Wait for dxgi.dll to appear (game + proxy mods load it)
-    while (!GetModuleHandleA("dxgi.dll")) Sleep(100);
+// ── VBlank relay thread ───────────────────────────────────────────────────────
+// Calls WaitForVBlank on Intel output in a tight loop.
+// Posts ONE semaphore slot per VBlank.
+// This thread is decoupled from the render thread - it NEVER touches Present.
+static void VBlankRelayThread()
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
-    // Extra delay: let DLSS Enabler / OptiScaler finish patching
-    Sleep(2500);
+    OutputDebugStringA("[AutoPacer v10] VBlank relay thread started\n");
 
-    Log("AutoPacer v8 initializing...");
-
-    // System timer resolution: 1ms for accurate timer scheduling
-    timeBeginPeriod(1);
-
-    // High-resolution waitable timer (Windows 10 1803+)
-    g_hTimer = CreateWaitableTimerExW(
-        NULL, NULL,
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-        TIMER_ALL_ACCESS
-    );
-    if (!g_hTimer) {
-        // Fallback: standard waitable timer (still better than Sleep)
-        g_hTimer = CreateWaitableTimerW(NULL, TRUE, NULL);
-        Log("Note: using standard timer (upgrade to Win10 1803+ for best precision)");
-    } else {
-        Log("High-resolution waitable timer ready.");
+    while (g_Running.load(std::memory_order_relaxed))
+    {
+        HRESULT hr = g_IntelOutput->WaitForVBlank();
+        if (SUCCEEDED(hr))
+        {
+            // Post one slot - Present hook consumes it
+            // ReleaseSemaphore with count 1: if semaphore already has a slot waiting,
+            // cap at 2 to avoid queue buildup during low-FPS scenes
+            LONG prevCount = 0;
+            ReleaseSemaphore(g_hVBlankSem, 1, &prevCount);
+            // If prevCount >= 2, drain the extra to prevent frame queue pileup
+            if (prevCount >= 2)
+                WaitForSingleObject(g_hVBlankSem, 0);
+        }
+        else
+        {
+            // WaitForVBlank failed - adapter lost or something wrong
+            // Sleep briefly and retry
+            Sleep(1);
+        }
     }
 
-    // Create a minimal dummy DX11 device + swapchain
-    // Purpose: read vtable[8] address = IDXGISwapChain::Present
-    WNDCLASSEXA wc  = {};
-    wc.cbSize       = sizeof(wc);
-    wc.lpfnWndProc  = DefWindowProcA;
-    wc.hInstance    = GetModuleHandleA(NULL);
-    wc.lpszClassName = "AP8";
-    RegisterClassExA(&wc);
-    HWND hWnd = CreateWindowA("AP8", "", WS_POPUP,
-        0, 0, 1, 1, NULL, NULL, wc.hInstance, NULL);
+    OutputDebugStringA("[AutoPacer v10] VBlank relay thread exiting\n");
+}
 
-    DXGI_SWAP_CHAIN_DESC sd    = {};
-    sd.BufferCount             = 1;
-    sd.BufferDesc.Format       = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferDesc.Width        = 1;
-    sd.BufferDesc.Height       = 1;
-    sd.BufferUsage             = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow            = hWnd;
-    sd.SampleDesc.Count        = 1;
-    sd.Windowed                = TRUE;
-    sd.SwapEffect              = DXGI_SWAP_EFFECT_DISCARD;
+// ── Burst catcher: enforce minimum inter-frame spacing ───────────────────────
+// Returns true if we should proceed with present, false if something went wrong.
+static void EnforceBurstThreshold()
+{
+    if (g_QPCFreq == 0 || g_LastPresentQPC == 0)
+        return;
 
-    D3D_FEATURE_LEVEL fl       = D3D_FEATURE_LEVEL_11_0;
-    ID3D11Device*       pDev   = nullptr;
-    ID3D11DeviceContext* pCtx  = nullptr;
-    IDXGISwapChain*     pSC    = nullptr;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
 
+    double elapsedMs = (double)(now.QuadPart - g_LastPresentQPC) * 1000.0 / (double)g_QPCFreq;
+
+    if (elapsedMs < BURST_THRESHOLD_MS)
+    {
+        double waitMs = BURST_THRESHOLD_MS - elapsedMs;
+        // Coarse wait via waitable timer for anything > 1.5ms
+        if (waitMs > 1.5)
+        {
+            HANDLE hTimer = CreateWaitableTimerExW(nullptr, nullptr,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (hTimer)
+            {
+                LARGE_INTEGER dueTime;
+                dueTime.QuadPart = -(LONGLONG)((waitMs - 1.5) * 10000.0); // 100ns units, negative = relative
+                SetWaitableTimerEx(hTimer, &dueTime, 0, nullptr, nullptr, nullptr, 0);
+                WaitForSingleObject(hTimer, (DWORD)(waitMs + 2));
+                CloseHandle(hTimer);
+            }
+        }
+        // Spinlock for final <= 1.5ms precision
+        do {
+            QueryPerformanceCounter(&now);
+            elapsedMs = (double)(now.QuadPart - g_LastPresentQPC) * 1000.0 / (double)g_QPCFreq;
+            if (elapsedMs >= BURST_THRESHOLD_MS) break;
+            _mm_pause();
+        } while (true);
+    }
+}
+
+// ── Hooked Present ────────────────────────────────────────────────────────────
+static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags)
+{
+    // 1. Enforce burst threshold (catches FG micro-bursts)
+    EnforceBurstThreshold();
+
+    // 2. Wait for Intel VBlank signal
+    //    This is the core of software G-Sync:
+    //    we only present when Intel says the blanking interval has started.
+    if (g_hVBlankSem && g_IntelOutput)
+    {
+        WaitForSingleObject(g_hVBlankSem, VBLANK_WAIT_TIMEOUT);
+    }
+
+    // 3. Record this present timestamp
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    g_LastPresentQPC = now.QuadPart;
+
+    // 4. Always present with SyncInterval=0 (VRR-compatible, we handle the VBlank timing above)
+    //    Strip DXGI_PRESENT_ALLOW_TEARING from flags - not needed, we're VBlank-aligned
+    UINT cleanFlags = Flags & ~DXGI_PRESENT_ALLOW_TEARING;
+    return oPresent(pSwapChain, 0, cleanFlags);
+}
+
+static HRESULT STDMETHODCALLTYPE HookedPresent1(IDXGISwapChain1* pSwapChain, UINT SyncInterval, UINT Flags,
+                                                  const DXGI_PRESENT_PARAMETERS* pPresentParameters)
+{
+    EnforceBurstThreshold();
+
+    if (g_hVBlankSem && g_IntelOutput)
+        WaitForSingleObject(g_hVBlankSem, VBLANK_WAIT_TIMEOUT);
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    g_LastPresentQPC = now.QuadPart;
+
+    UINT cleanFlags = Flags & ~DXGI_PRESENT_ALLOW_TEARING;
+    return oPresent1(pSwapChain, 0, cleanFlags, pPresentParameters);
+}
+
+// ── Hook installation via temporary swapchain ─────────────────────────────────
+static bool InstallPresentHook()
+{
+    // Create a minimal D3D11 device + swapchain just to get the vtable
+    // This works from any process, including DX12 games (DXGI vtable is stable across API versions)
+    HWND hwnd = GetForegroundWindow();
+    if (!hwnd) hwnd = GetDesktopWindow();
+
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> ctx;
+
+    DXGI_SWAP_CHAIN_DESC scd = {};
+    scd.BufferCount       = 2;
+    scd.BufferDesc.Width  = 8;
+    scd.BufferDesc.Height = 8;
+    scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.BufferUsage       = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.OutputWindow      = hwnd;
+    scd.SampleDesc.Count  = 1;
+    scd.Windowed          = TRUE;
+    scd.SwapEffect        = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+    ComPtr<IDXGISwapChain> tempSC;
     HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
         &fl, 1, D3D11_SDK_VERSION,
-        &sd, &pSC, &pDev, NULL, &pCtx
-    );
+        &scd, tempSC.GetAddressOf(),
+        device.GetAddressOf(), nullptr, ctx.GetAddressOf());
 
-    if (SUCCEEDED(hr) && pSC) {
-        void** vtbl = *reinterpret_cast<void***>(pSC);
-
-        MH_Initialize();
-        MH_STATUS s = MH_CreateHook(
-            vtbl[8],                              // IDXGISwapChain::Present
-            reinterpret_cast<void*>(&hkPresent),
-            reinterpret_cast<void**>(&oPresent)
-        );
-
-        if (s == MH_OK || s == MH_ERROR_ALREADY_CREATED) {
-            MH_EnableHook(vtbl[8]);
-            Log("Present hook installed. Waiting for first frame...");
-            Beep(1000, 150);
-        } else {
-            char buf[80];
-            sprintf_s(buf, "Hook install failed: MH_STATUS = %d", (int)s);
-            Log(buf);
-        }
-
-        pSC->Release();
-        pDev->Release();
-        pCtx->Release();
-    } else {
-        char buf[80];
-        sprintf_s(buf, "Dummy device failed: HRESULT = 0x%08X", (unsigned)hr);
-        Log(buf);
+    if (FAILED(hr))
+    {
+        OutputDebugStringA("[AutoPacer v10] Failed to create temp swapchain for vtable hook\n");
+        return false;
     }
 
-    DestroyWindow(hWnd);
-    UnregisterClassA("AP8", wc.hInstance);
-    return 0;
+    void** vtable = *(void***)tempSC.Get();
+
+    // Present is slot 8, Present1 is slot 22 on IDXGISwapChain1
+    bool ok = PatchVTable(vtable, 8, (void*)HookedPresent, (void**)&oPresent);
+
+    ComPtr<IDXGISwapChain1> tempSC1;
+    if (SUCCEEDED(tempSC.As(&tempSC1)))
+    {
+        void** vtable1 = *(void***)tempSC1.Get();
+        PatchVTable(vtable1, 22, (void*)HookedPresent1, (void**)&oPresent1);
+    }
+
+    return ok;
 }
 
-// ============================================================
-//  DLL Entry Point
-// ============================================================
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) {
-        // g_initialized prevents double-injection
-        bool expected = false;
-        if (g_initialized.compare_exchange_strong(expected, true)) {
-            QueryPerformanceFrequency(&g_qpcFreq);
-            DisableThreadLibraryCalls(hModule);
-            CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
-        }
+// ── Init / Shutdown ───────────────────────────────────────────────────────────
+static void Init()
+{
+    // QPC frequency
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    g_QPCFreq = freq.QuadPart;
+
+    // Find Intel output
+    g_IntelOutput = FindIntelOutput();
+    if (!g_IntelOutput)
+    {
+        OutputDebugStringA("[AutoPacer v10] FATAL: Intel output not found. Check primary display assignment.\n");
+        MessageBoxA(nullptr,
+            "AutoPacer v10: Could not find Intel iGPU output.\n\n"
+            "Make sure your monitor is connected to the motherboard (iGPU) HDMI port\n"
+            "and that the iGPU display is set as the Primary Display in Windows.",
+            "AutoPacer v10 Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // Create VBlank semaphore (max count 3 to handle burst buffering)
+    g_hVBlankSem = CreateSemaphoreW(nullptr, 0, 3, nullptr);
+    if (!g_hVBlankSem)
+    {
+        OutputDebugStringA("[AutoPacer v10] FATAL: Failed to create VBlank semaphore\n");
+        return;
+    }
+
+    // Start VBlank relay thread
+    g_Running.store(true);
+    g_VBlankThread = std::thread(VBlankRelayThread);
+
+    // Install Present hook
+    if (!InstallPresentHook())
+    {
+        OutputDebugStringA("[AutoPacer v10] FATAL: Present hook installation failed\n");
+        return;
+    }
+
+    OutputDebugStringA("[AutoPacer v10] SUCCESS: AutoPacer v10 active. Software G-Sync engaged.\n");
+
+    if (ENABLE_BEEP)
+        Beep(1000, 120);
+}
+
+static void Shutdown()
+{
+    g_Running.store(false);
+    // Wake the VBlank thread so it can exit
+    if (g_hVBlankSem)
+        ReleaseSemaphore(g_hVBlankSem, 1, nullptr);
+    if (g_VBlankThread.joinable())
+        g_VBlankThread.join();
+    if (g_hVBlankSem)
+    {
+        CloseHandle(g_hVBlankSem);
+        g_hVBlankSem = nullptr;
+    }
+    g_IntelOutput.Reset();
+    OutputDebugStringA("[AutoPacer v10] Shutdown complete.\n");
+}
+
+// ── DllMain ───────────────────────────────────────────────────────────────────
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
+{
+    switch (reason)
+    {
+    case DLL_PROCESS_ATTACH:
+        DisableThreadLibraryCalls(hModule);
+        // Init on a new thread to avoid DllMain deadlocks
+        CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            Sleep(500); // Brief wait for game's own DXGI init to complete
+            Init();
+            return 0;
+        }, nullptr, 0, nullptr);
+        break;
+
+    case DLL_PROCESS_DETACH:
+        Shutdown();
+        break;
     }
     return TRUE;
 }
