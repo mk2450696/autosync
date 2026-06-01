@@ -1,10 +1,11 @@
-// AutoPacer v19 - Dynamic VRR Smoother (Software G-Sync Emulator)
+// AutoPacer v20 - Asynchronous Hardware Queue Delegate
 //
-// Abandons static FPS limits. Instead, it maintains a real-time rolling average
-// of the game's actual framerate. It acts as a smart queue, catching burst frames
-// from FG mods and spacing them perfectly according to the current natural framerate.
-// This feeds a smooth, evenly-paced stream of frames to the Intel iGPU, allowing
-// VRR to function flawlessly at any framerate.
+// Completely abandons CPU-based sleeping and thread-blocking (which caused 
+// 48 FPS locks and infinite loading screens by starving the game engine).
+// Instead, it measures frame arrival times instantly. Base frames are passed
+// with VRR (ALLOW_TEARING) intact. Burst frames (from Frame Gen) have the tearing 
+// flag stripped, forcing the Intel DWM compositor to hardware-queue them to the 
+// next VBlank, preventing tearing natively without ever blocking the CPU thread.
 
 #include <windows.h>
 #include <dxgi.h>
@@ -20,14 +21,14 @@ static char             g_logPath[MAX_PATH] = "AutoPacer.log";
 
 static void Log(const char* msg)
 {
-    OutputDebugStringA("[AutoPacer v19] ");
+    OutputDebugStringA("[AutoPacer v20] ");
     OutputDebugStringA(msg);
     OutputDebugStringA("\n");
     if (!g_logCSInit) return;
     EnterCriticalSection(&g_logCS);
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v19] %s\n", msg);
+        fprintf(fp, "[AutoPacer v20] %s\n", msg);
         fclose(fp);
     }
     LeaveCriticalSection(&g_logCS);
@@ -38,17 +39,10 @@ static void Logf(const char* fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, a); va_end(a); Log(buf);
 }
 
-// ── Dynamic Pacer State ───────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 static bool g_FirstFrame = true;
 static LARGE_INTEGER g_qpcFreq;
-
-// Rolling Average History (tracks the natural unpaced framerate)
-const int HISTORY_SIZE = 16;
-static double g_DeltaHistory[HISTORY_SIZE];
-static int g_HistoryIdx = 0;
-
-static double g_LastArriveTime  = 0.0;
-static double g_LastReleaseTime = 0.0;
+static double g_LastPresentTime = 0.0;
 
 static double GetTimeMs()
 {
@@ -56,9 +50,6 @@ static double GetTimeMs()
     QueryPerformanceCounter(&qpc);
     return (double)(qpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
 }
-
-// WinMM timer resolution (using UINT instead of MMRESULT to avoid mmsystem.h dependency)
-typedef UINT (WINAPI* timeBeginPeriod_t)(UINT uPeriod);
 
 // ── VTable helpers ────────────────────────────────────────────────────────────
 static bool WritePtr(void** addr, void* newVal, void** oldVal)
@@ -75,79 +66,38 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── Hooked Present (The Dynamic Smoother) ─────────────────────────────────────
+// ── Hooked Present (Hardware Delegate) ────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
     if (g_FirstFrame)
     {
         QueryPerformanceFrequency(&g_qpcFreq);
-        
-        HMODULE hWinMM = LoadLibraryA("winmm.dll");
-        if (hWinMM) {
-            auto tbp = (timeBeginPeriod_t)GetProcAddress(hWinMM, "timeBeginPeriod");
-            if (tbp) tbp(1); // 1ms sleep precision
-        }
-
-        double now = GetTimeMs();
-        g_LastArriveTime = now;
-        g_LastReleaseTime = now;
-
-        // Initialize history with a safe baseline (e.g., 60fps = 16.6ms)
-        for (int i = 0; i < HISTORY_SIZE; i++) {
-            g_DeltaHistory[i] = 16.666;
-        }
-
+        g_LastPresentTime = GetTimeMs();
         g_FirstFrame = false;
-        Log("First Present! Dynamic VRR Smoother Active.");
+        
+        Log("First Present! Asynchronous Hardware Pacer Active.");
         Beep(1000, 120);
     }
 
     double now = GetTimeMs();
-    
-    // 1. Measure the natural gap between frames arriving from the game/mod
-    double arrivalDelta = now - g_LastArriveTime;
-    g_LastArriveTime = now;
+    double gap = now - g_LastPresentTime;
+    g_LastPresentTime = now;
 
-    // Ignore massive load-screen spikes so they don't break the math
-    if (arrivalDelta > 5.0 && arrivalDelta < 100.0) {
-        g_DeltaHistory[g_HistoryIdx] = arrivalDelta;
-        g_HistoryIdx = (g_HistoryIdx + 1) % HISTORY_SIZE;
+    UINT finalFlags = Flags;
+    UINT finalSync = SyncInterval;
+
+    // If the frame arrives less than 4ms after the previous one, it is a Frame Gen burst.
+    // We strip the ALLOW_TEARING flag. This returns control to the mod instantly (0ms delay),
+    // but forces the Intel display driver to lock this specific frame to the next VBlank
+    // instead of tearing the screen.
+    if (gap < 4.0)
+    {
+        finalFlags &= ~DXGI_PRESENT_ALLOW_TEARING;
+        finalSync = 0; // Ensure DXGI doesn't CPU-block us natively
     }
 
-    // 2. Calculate the dynamic average frametime of the game right now
-    double sum = 0.0;
-    for (int i = 0; i < HISTORY_SIZE; i++) sum += g_DeltaHistory[i];
-    double dynamicTargetInterval = sum / (double)HISTORY_SIZE;
-
-    // 3. Determine exactly when this frame SHOULD be released to the monitor
-    double targetReleaseTime = g_LastReleaseTime + dynamicTargetInterval;
-
-    // Safety net: If the game naturally lagged, don't delay it further
-    if (now >= targetReleaseTime) {
-        targetReleaseTime = now;
-    }
-    // Safety net: Never delay a frame by more than 20ms to prevent game engine freezing
-    else if (targetReleaseTime - now > 20.0) {
-        targetReleaseTime = now + 20.0;
-    }
-
-    // 4. Smooth Queue: Hold the burst frame until its perfect dynamic timeslot
-    if (now < targetReleaseTime) {
-        while (true) {
-            double t = GetTimeMs();
-            if (t >= targetReleaseTime) break;
-            
-            if (targetReleaseTime - t > 2.0) {
-                Sleep(1); // Give CPU back to the Frame Gen mod
-            } else {
-                YieldProcessor(); // Micro-spin for exact millisecond precision
-            }
-        }
-    }
-
-    // 5. Release to the screen!
-    g_LastReleaseTime = GetTimeMs();
-    return oPresent(pSC, SyncInterval, Flags);
+    // Call the original Present instantly. No sleeps. No loops.
+    return oPresent(pSC, finalSync, finalFlags);
 }
 
 // ── Init: Create Dummy Swapchain to Steal VTable ──────────────────────────────
@@ -179,9 +129,8 @@ static DWORD WINAPI InitThread(LPVOID)
         }
     }
 
-    // Wait for DLSS Enabler and OptiScaler to finish hooking
     Sleep(500);
-    Log("Mod settle time elapsed. Spawning dummy swapchain to steal VTable.");
+    Log("Spawning dummy swapchain to steal VTable.");
 
     WNDCLASSEXA wc = { sizeof(wc), CS_OWNDC, DefWindowProcA, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, "DummyWindow", nullptr };
     RegisterClassExA(&wc);
@@ -207,22 +156,15 @@ static DWORD WINAPI InitThread(LPVOID)
     if (SUCCEEDED(hr) && pDummySC)
     {
         void** vtable = *(void***)pDummySC;
-        
-        if (WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent))
-        {
+        if (WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent)) {
             Logf("SUCCESS: Present chain wrap installed! Slot 8 was: %p", oPresent);
         }
-        else Log("ERROR: VTable write failed.");
-
         pDummySC->Release();
         pDummyDev->Release();
     }
-    else Logf("ERROR: Dummy swapchain creation failed: 0x%08X", (unsigned)hr);
 
     DestroyWindow(dummyWnd);
     UnregisterClassA("DummyWindow", wc.hInstance);
-
-    Log("InitThread finished. Waiting for next real frame present...");
     return 0;
 }
 
@@ -243,7 +185,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath);
         }
 
-        Log("DLL loaded - v19 Dynamic VRR Smoother");
+        Log("DLL loaded - v20 Hardware Queue Delegate");
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
     }
     else if (reason == DLL_PROCESS_DETACH)
