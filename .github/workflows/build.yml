@@ -1,4 +1,4 @@
-name: Build AutoPacer v14
+name: Build AutoPacer v16
 
 on:
   push:
@@ -33,6 +33,6 @@ jobs:
     - name: Upload
       uses: actions/upload-artifact@v4
       with:
-        name: AutoPacer-v14
+        name: AutoPacer-v16
         path: build\Release\AutoPacer.asi
         retention-days: 30
