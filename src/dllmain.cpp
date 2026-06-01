@@ -20,6 +20,8 @@
 #include <d3d11.h>
 #include <atomic>
 #include <thread>
+#include <string.h>  // _stricmp, strncpy_s
+#include <stdio.h>   // sprintf_s, fopen_s, fprintf
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 // Minimum nanoseconds between frames. Must be >= one VBlank period.
@@ -71,20 +73,51 @@ static bool PatchVTable(void** vtable, int slot, void* newFn, void** oldFn)
     return true;
 }
 
-// ── Find Intel IDXGIOutput via primary monitor HWND ───────────────────────────
-// DWM confirmed on Intel (iGPU), Intel owns primary monitor.
-// Match IDXGIOutput by monitor handle from primary monitor.
-static IDXGIOutput* FindIntelOutput()
+// ── Find the IDXGIOutput that owns the primary monitor ────────────────────────
+//
+// Your system has \\.\DISPLAY5 as primary (Lenovo Y27q-20, DisplayPort, Intel iGPU).
+// There are phantom/virtual display slots before it, so searching by index 0 fails.
+// NVIDIA is VendorId 0x10DE - we explicitly skip it.
+//
+// Strategy (in order, first match wins):
+//   1. Device name matches "\\.\DISPLAY5" (known stable on this system, logged for debug)
+//   2. DXGI_OUTPUT_DESC.Monitor handle matches MonitorFromPoint({0,0}) = primary monitor
+//   3. DesktopCoordinates top-left matches primary monitor rect top-left
+//      AND adapter is not NVIDIA
+//
+// All three strategies skip: software adapters, NVIDIA adapters (0x10DE).
+// The log file will show exactly which strategy succeeded and what was enumerated.
+
+static IDXGIOutput* FindPrimaryOutput()
 {
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory)))
+    {
+        Log("[AutoPacer v10] ERROR: CreateDXGIFactory1 failed");
         return nullptr;
+    }
 
+    // Get primary monitor info once
     HMONITOR hPrimary = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXA mi = {}; mi.cbSize = sizeof(mi);
+    GetMonitorInfoA(hPrimary, &mi);
 
-    IDXGIOutput* result = nullptr;
+    char primaryDevice[32] = {};
+    strncpy_s(primaryDevice, mi.szDevice, 31); // e.g. "\\.\DISPLAY5"
 
-    for (UINT ai = 0; !result; ++ai)
+    char logbuf[256];
+    sprintf_s(logbuf, "[AutoPacer v10] Primary monitor: handle=0x%p device='%s' rect=(%d,%d,%d,%d)",
+        (void*)hPrimary,
+        primaryDevice,
+        mi.rcMonitor.left, mi.rcMonitor.top,
+        mi.rcMonitor.right, mi.rcMonitor.bottom);
+    Log(logbuf);
+
+    IDXGIOutput* result       = nullptr;
+    int          matchStrategy = 0;
+    char         matchDesc[128] = {};
+
+    for (UINT ai = 0; ; ++ai)
     {
         IDXGIAdapter1* adapter = nullptr;
         if (FAILED(factory->EnumAdapters1(ai, &adapter))) break;
@@ -92,8 +125,19 @@ static IDXGIOutput* FindIntelOutput()
         DXGI_ADAPTER_DESC1 adesc;
         adapter->GetDesc1(&adesc);
 
-        // Skip software adapters (Microsoft Basic Render Driver, etc.)
-        if (adesc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+        // Convert adapter name for logging
+        char adapterName[128] = {};
+        WideCharToMultiByte(CP_ACP, 0, adesc.Description, -1, adapterName, 127, nullptr, nullptr);
+
+        // Skip software adapters and NVIDIA
+        bool isSoftware = (adesc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+        bool isNVIDIA   = (adesc.VendorId == 0x10DE);
+
+        sprintf_s(logbuf, "[AutoPacer v10]   Adapter %u: '%s' vendor=0x%04X software=%d",
+            ai, adapterName, adesc.VendorId, (int)isSoftware);
+        Log(logbuf);
+
+        if (isSoftware || isNVIDIA)
         {
             adapter->Release();
             continue;
@@ -107,68 +151,66 @@ static IDXGIOutput* FindIntelOutput()
             DXGI_OUTPUT_DESC odesc;
             output->GetDesc(&odesc);
 
-            // Primary match: monitor handle + vendor is Intel (0x8086)
-            if (odesc.Monitor == hPrimary && adesc.VendorId == 0x8086)
+            // Convert output device name for comparison and logging
+            char devName[32] = {};
+            WideCharToMultiByte(CP_ACP, 0, odesc.DeviceName, -1, devName, 31, nullptr, nullptr);
+
+            sprintf_s(logbuf, "[AutoPacer v10]     Output %u: device='%s' monitor=0x%p coords=(%d,%d,%d,%d)",
+                oi, devName, (void*)odesc.Monitor,
+                odesc.DesktopCoordinates.left, odesc.DesktopCoordinates.top,
+                odesc.DesktopCoordinates.right, odesc.DesktopCoordinates.bottom);
+            Log(logbuf);
+
+            // Strategy 1: device name match (most reliable, hardcoded to your \\.\DISPLAY5)
+            if (!result && _stricmp(devName, primaryDevice) == 0)
             {
-                char buf[256];
-                char name[128] = {};
-                WideCharToMultiByte(CP_ACP, 0, adesc.Description, -1, name, 127, nullptr, nullptr);
-                sprintf_s(buf, "[AutoPacer v10] Intel output found: %s (adapter %u, output %u)", name, ai, oi);
-                Log(buf);
-                result = output; // addref held
-                break;
+                result = output;
+                matchStrategy = 1;
+                sprintf_s(matchDesc, "device name match '%s' on adapter '%s'", devName, adapterName);
+                // Don't break - keep logging remaining outputs
+                output = nullptr; // don't release, we own it now
             }
-            output->Release();
+
+            // Strategy 2: HMONITOR match
+            if (!result && odesc.Monitor == hPrimary)
+            {
+                result = output;
+                matchStrategy = 2;
+                sprintf_s(matchDesc, "HMONITOR match on adapter '%s' output %u", adapterName, oi);
+                output = nullptr;
+            }
+
+            // Strategy 3: coordinate match
+            if (!result &&
+                odesc.DesktopCoordinates.left == mi.rcMonitor.left &&
+                odesc.DesktopCoordinates.top  == mi.rcMonitor.top  &&
+                odesc.DesktopCoordinates.right  > odesc.DesktopCoordinates.left)
+            {
+                result = output;
+                matchStrategy = 3;
+                sprintf_s(matchDesc, "coordinate match (%d,%d) on adapter '%s' output %u",
+                    mi.rcMonitor.left, mi.rcMonitor.top, adapterName, oi);
+                output = nullptr;
+            }
+
+            if (output) output->Release();
         }
         adapter->Release();
     }
 
-    // Fallback: any non-NVIDIA, non-software adapter whose output has the primary monitor
-    if (!result)
-    {
-        Log("[AutoPacer v10] Primary match failed, trying coordinate fallback...");
-        MONITORINFO mi = {}; mi.cbSize = sizeof(mi);
-        GetMonitorInfoA(hPrimary, &mi);
-
-        for (UINT ai = 0; !result; ++ai)
-        {
-            IDXGIAdapter1* adapter = nullptr;
-            if (FAILED(factory->EnumAdapters1(ai, &adapter))) break;
-
-            DXGI_ADAPTER_DESC1 adesc;
-            adapter->GetDesc1(&adesc);
-
-            if ((adesc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || adesc.VendorId == 0x10DE)
-            {
-                adapter->Release();
-                continue;
-            }
-
-            for (UINT oi = 0; ; ++oi)
-            {
-                IDXGIOutput* output = nullptr;
-                if (FAILED(adapter->EnumOutputs(oi, &output))) break;
-
-                DXGI_OUTPUT_DESC odesc;
-                output->GetDesc(&odesc);
-
-                if (odesc.DesktopCoordinates.left == mi.rcMonitor.left &&
-                    odesc.DesktopCoordinates.top  == mi.rcMonitor.top)
-                {
-                    Log("[AutoPacer v10] Intel output found via coordinate fallback");
-                    result = output;
-                    break;
-                }
-                output->Release();
-            }
-            adapter->Release();
-        }
-    }
-
     factory->Release();
 
-    if (!result)
-        Log("[AutoPacer v10] ERROR: Could not find Intel output! Check primary display settings.");
+    if (result)
+    {
+        sprintf_s(logbuf, "[AutoPacer v10] SUCCESS: Output found via strategy %d: %s", matchStrategy, matchDesc);
+        Log(logbuf);
+    }
+    else
+    {
+        Log("[AutoPacer v10] ERROR: No matching output found after full enumeration.");
+        Log("[AutoPacer v10] Check AutoPacer.log for the full adapter/output list above.");
+        Log("[AutoPacer v10] Ensure iGPU display is set as Primary in Windows Display Settings.");
+    }
 
     return result;
 }
@@ -330,14 +372,15 @@ static DWORD WINAPI InitThread(LPVOID)
     QueryPerformanceFrequency(&freq);
     g_QPCFreq = freq.QuadPart;
 
-    // Find Intel output
-    g_IntelOutput = FindIntelOutput();
+    // Find primary display output (Intel iGPU)
+    g_IntelOutput = FindPrimaryOutput();
     if (!g_IntelOutput)
     {
         MessageBoxA(nullptr,
-            "AutoPacer v10: Could not find Intel iGPU output.\n\n"
-            "Ensure your monitor is on the motherboard HDMI port\n"
-            "and the iGPU display is set as Primary in Windows.",
+            "AutoPacer v10: Could not find the primary display output.\n\n"
+            "Check AutoPacer.log in the game folder for the full\n"
+            "adapter enumeration. Ensure the iGPU display (motherboard\n"
+            "DisplayPort/HDMI) is set as Primary in Windows Display Settings.",
             "AutoPacer v10", MB_OK | MB_ICONERROR);
         return 1;
     }
