@@ -1,9 +1,9 @@
-// AutoPacer v24 - Multi-Swapchain & Thread Tracker
+// AutoPacer v25 - The Hardware Prober
 //
-// Hooks Present globally, but records the Swapchain Memory Address, Thread ID, 
-// and Resolution (Width/Height) of every call. 
-// This will separate overlays and mod-proxies from the real game output, 
-// and track exactly where the DXGI_PRESENT_TEST (0x1) is disappearing.
+// Based purely on the CSV data: the FG Mod deletes the DXGI_PRESENT_TEST (0x1) 
+// that the stock game uses to synchronize the Intel display queue over CASO.
+// This version intercepts the Mod's ALLOW_TEARING present and manually injects 
+// the 0x1 probe right before it, restoring the stock hardware behavior.
 
 #include <windows.h>
 #include <dxgi.h>
@@ -11,41 +11,15 @@
 #include <d3d11.h>
 #include <stdio.h>
 
-static char g_csvPath[MAX_PATH] = "AutoPacer_SwapchainStats.csv";
 static char g_logPath[MAX_PATH] = "AutoPacer.log";
+static bool g_FirstFrame = true;
 
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v24] %s\n", msg);
+        fprintf(fp, "[AutoPacer v25] %s\n", msg);
         fclose(fp);
     }
-}
-
-// ── Telemetry State ───────────────────────────────────────────────────────────
-struct FrameRecord {
-    int frameNum;
-    void* swapchainPtr;
-    DWORD threadId;
-    UINT width;
-    UINT height;
-    double arrivalGapMs;
-    UINT flags;
-};
-
-const int MAX_FRAMES = 600;
-static FrameRecord g_Records[MAX_FRAMES];
-static int g_FrameCount = 0;
-static bool g_TelemetryDone = false;
-
-static bool g_FirstFrame = true;
-static LARGE_INTEGER g_qpcFreq;
-static double g_LastTime = 0.0;
-
-static double GetTimeMs() {
-    LARGE_INTEGER qpc;
-    QueryPerformanceCounter(&qpc);
-    return (double)(qpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
 }
 
 // ── VTable helpers ────────────────────────────────────────────────────────────
@@ -62,55 +36,23 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── Hooked Present (Swapchain Tracker) ────────────────────────────────────────
+// ── Hooked Present (The 0x1 Injector) ─────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
     if (g_FirstFrame) {
-        QueryPerformanceFrequency(&g_qpcFreq);
-        g_LastTime = GetTimeMs();
         g_FirstFrame = false;
-        Log("Telemetry Started. Tracking all Swapchains and Threads.");
+        Log("First Present! Injecting DXGI_PRESENT_TEST (0x1) before frames.");
         Beep(1000, 100);
     }
 
-    if (!g_TelemetryDone) {
-        double now = GetTimeMs();
-        double gap = now - g_LastTime;
-        g_LastTime = now;
-
-        // Get Resolution to identify if it's the game or an overlay
-        DXGI_SWAP_CHAIN_DESC desc = {};
-        UINT width = 0;
-        UINT height = 0;
-        if (SUCCEEDED(pSC->GetDesc(&desc))) {
-            width = desc.BufferDesc.Width;
-            height = desc.BufferDesc.Height;
-        }
-
-        DWORD tid = GetCurrentThreadId();
-
-        // Save to memory
-        if (g_FrameCount < MAX_FRAMES) {
-            g_Records[g_FrameCount] = { g_FrameCount, pSC, tid, width, height, gap, Flags };
-            g_FrameCount++;
-        } 
-        else {
-            g_TelemetryDone = true;
-            FILE* fp;
-            if (fopen_s(&fp, g_csvPath, "w") == 0) {
-                fprintf(fp, "Frame,SwapchainAddr,ThreadID,Width,Height,ArrivalGapMs,Flags\n");
-                for (int i = 0; i < MAX_FRAMES; i++) {
-                    fprintf(fp, "%d,%p,%lu,%u,%u,%.3f,0x%X\n", 
-                        g_Records[i].frameNum, g_Records[i].swapchainPtr, g_Records[i].threadId,
-                        g_Records[i].width, g_Records[i].height, g_Records[i].arrivalGapMs, g_Records[i].flags);
-                }
-                fclose(fp);
-            }
-            Log("Telemetry complete. CSV written.");
-            Beep(1500, 200);
-        }
+    // Only inject the test if the mod is actually trying to push a frame with ALLOW_TEARING
+    if (Flags & DXGI_PRESENT_ALLOW_TEARING) {
+        // Spoof the stock game's hardware probe: "Are you ready?"
+        // We use 0 for SyncInterval and 0x1 (DXGI_PRESENT_TEST) for the flag.
+        oPresent(pSC, 0, DXGI_PRESENT_TEST);
     }
 
+    // Immediately pass the actual frame down the pipeline, just like the stock game does.
     return oPresent(pSC, SyncInterval, Flags);
 }
 
@@ -155,7 +97,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) {
             *(lastSlash + 1) = '\0';
-            snprintf(g_csvPath, sizeof(g_csvPath), "%sAutoPacer_SwapchainStats.csv", dllPath);
             snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath);
         }
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
