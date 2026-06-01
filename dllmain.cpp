@@ -58,7 +58,7 @@ static Present_t oPresent = nullptr;
 //    5000000 = 5.0ms (tighter, use if tearing persists)
 //    6000000 = 6.0ms (stricter ceiling, closer to 165Hz limit)
 // ============================================================
-static const long long MIN_FRAME_NS = 5500000LL;
+static const long long MIN_FRAME_NS = 6200000LL; // 6.2ms: above 165Hz VBlank (6.06ms) so each frame gets its own full VBlank cycle
 
 // How many ns before the target to switch from timer to spinlock.
 // The timer wakes us ~0.5ms early, spinlock covers precision gap.
@@ -139,7 +139,7 @@ static HRESULT __stdcall hkPresent(IDXGISwapChain* pSC, UINT syncInterval, UINT 
 
     if (g_firstFrame) {
         g_firstFrame = false;
-        Log("SUCCESS: AutoPacer v8 active. Burst threshold: 5.5ms");
+        Log("SUCCESS: AutoPacer v8 active. Burst threshold: 6.2ms (one frame per 165Hz VBlank guaranteed)");
         Beep(880, 120);
     }
 
