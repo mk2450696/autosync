@@ -1,6 +1,11 @@
-name: Build AutoPacer v8
+name: Build AutoPacer v10
 
-on: workflow_dispatch
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -10,27 +15,20 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Setup MSVC x64
-      uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x64
-
-    - name: Install MinHook static
-      run: vcpkg install minhook:x64-windows-static
-
-    - name: Configure CMake
-      shell: pwsh
+    - name: Configure CMake (x64 Release)
       run: |
-        cmake -B build -S . `
-          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-          -DVCPKG_TARGET_TRIPLET="x64-windows-static" `
-          -A x64
+        cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release
 
     - name: Build
       run: cmake --build build --config Release
 
-    - name: Upload
+    - name: Rename DLL to ASI
+      run: |
+        copy build\Release\AutoPacer.dll build\Release\AutoPacer.asi
+
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: AutoPacer-v8
-        path: build/Release/AutoPacer.dll
+        name: AutoPacer-v10
+        path: build\Release\AutoPacer.asi
+        retention-days: 30
