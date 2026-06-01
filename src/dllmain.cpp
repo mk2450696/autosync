@@ -1,11 +1,10 @@
-// AutoPacer v33 - The Queue Restrictor
+// AutoPacer v34 - Deep Telemetry & The 5.5ms Minimum Gap Enforcer
 //
-// The Mod forces a 6-buffer swapchain, which destroys the natural backpressure of the
-// display pipeline, causing frames to pile up and overwrite each other (0.000ms gaps).
-// Because we cannot alter the buffer count at creation without crashing the Mod, 
-// we dynamically set MaximumFrameLatency to 1 on the very first frame.
-// This forces the Mod's Waitable Object to physically block until the Intel display 
-// is actually ready, flawlessly replicating the stock game's pacing and restoring VRR.
+// 1. Implements a global Exception Handler to catch and log crashes.
+// 2. Extracts and logs deep DXGI swapchain telemetry upon the first Present.
+// 3. Implements the strict 5.5ms Minimum Gap Enforcer. If a frame arrives less 
+//    than 5.5ms after the previous one, it holds the thread. This physically 
+//    prevents the PCIe "double arrival" (0.000ms gaps) while preserving VRR.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -17,18 +16,44 @@
 #include <stdio.h>
 
 static char g_logPath[MAX_PATH] = "AutoPacer.log";
-static bool g_FirstFrame = true;
+
+// ── Logging System ────────────────────────────────────────────────────────────
+static CRITICAL_SECTION g_logCS;
+static bool g_logCSInit = false;
 
 static void Log(const char* msg) {
+    if (g_logCSInit) EnterCriticalSection(&g_logCS);
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v33] %s\n", msg);
+        fprintf(fp, "[AutoPacer v34] %s\n", msg);
         fclose(fp);
     }
+    if (g_logCSInit) LeaveCriticalSection(&g_logCS);
 }
+
 static void Logf(const char* fmt, ...) {
-    char buf[512]; va_list a; va_start(a, fmt);
+    char buf[1024]; va_list a; va_start(a, fmt);
     vsnprintf(buf, sizeof(buf), fmt, a); va_end(a); Log(buf);
+}
+
+// ── Global Crash Handler ──────────────────────────────────────────────────────
+LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
+    DWORD exceptionCode = pExceptionInfo->ExceptionRecord->ExceptionCode;
+    PVOID exceptionAddress = pExceptionInfo->ExceptionRecord->ExceptionAddress;
+    Logf("FATAL CRASH DETECTED! Exception Code: 0x%08X at Address: %p", exceptionCode, exceptionAddress);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// ── Pacing State ──────────────────────────────────────────────────────────────
+static bool g_FirstFrame = true;
+static LARGE_INTEGER g_qpcFreq;
+static double g_LastReleaseTime = 0.0;
+const double MINIMUM_GAP_MS = 5.5; // Strictly under 6.06ms (165Hz) to preserve VRR
+
+static double GetTimeMs() {
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    return (double)(qpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
 }
 
 // ── VTable helpers ────────────────────────────────────────────────────────────
@@ -50,31 +75,51 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
 {
     if (g_FirstFrame) {
         g_FirstFrame = false;
+        QueryPerformanceFrequency(&g_qpcFreq);
+        g_LastReleaseTime = GetTimeMs();
         
-        // Query the modern SwapChain2 interface to access the Waitable Object rules
-        IDXGISwapChain2* pSC2 = nullptr;
-        if (SUCCEEDED(pSC->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&pSC2))) {
-            
-            // Force the Waitable Object queue depth down to 1.
-            // This prevents the Mod from flooding the Intel iGPU with 6 frames at once.
-            HRESULT hr = pSC2->SetMaximumFrameLatency(1);
-            
-            if (SUCCEEDED(hr)) {
-                Log("SUCCESS: SetMaximumFrameLatency forced to 1.");
-                Beep(1000, 150); // High beep = Success
-            } else {
-                Logf("WARNING: SetMaximumFrameLatency failed with HRESULT 0x%08X", hr);
-                Beep(500, 300);  // Low beep = Failure
-            }
-            
-            pSC2->Release();
+        Log("=================================================");
+        Log("FIRST PRESENT INTERCEPTED - EXTRACTING TELEMETRY:");
+        
+        DXGI_SWAP_CHAIN_DESC desc = {};
+        if (SUCCEEDED(pSC->GetDesc(&desc))) {
+            Logf("Resolution : %u x %u", desc.BufferDesc.Width, desc.BufferDesc.Height);
+            Logf("Format     : %d", desc.BufferDesc.Format);
+            Logf("RefreshRate: %u / %u", desc.BufferDesc.RefreshRate.Numerator, desc.BufferDesc.RefreshRate.Denominator);
+            Logf("BufferCount: %u", desc.BufferCount);
+            Logf("SwapEffect : %d (4 = FLIP_DISCARD)", desc.SwapEffect);
+            Logf("Flags      : 0x%X", desc.Flags);
+            Logf("Windowed   : %s", desc.Windowed ? "TRUE" : "FALSE");
         } else {
-            Log("ERROR: Swapchain does not support IDXGISwapChain2.");
+            Log("WARNING: Failed to get SwapChain Description.");
+        }
+        
+        HWND hwnd = desc.OutputWindow;
+        if (hwnd) {
+            char title[256] = {};
+            GetWindowTextA(hwnd, title, sizeof(title));
+            Logf("Target HWND: %p | Title: '%s'", hwnd, title);
+        }
+        Log("=================================================");
+        Logf("Minimum Gap Enforcer Active: Target = %.2f ms", MINIMUM_GAP_MS);
+        Beep(1000, 150);
+    }
+
+    // --- THE 5.5ms GAP ENFORCER ---
+    double now = GetTimeMs();
+    double timeSinceLast = now - g_LastReleaseTime;
+
+    if (timeSinceLast < MINIMUM_GAP_MS) {
+        double targetTime = g_LastReleaseTime + MINIMUM_GAP_MS;
+        // Spin lock for absolute microsecond precision
+        while (GetTimeMs() < targetTime) {
+            YieldProcessor(); 
         }
     }
 
-    // Call the original Present. 
-    // Because MaximumFrameLatency is 1, Windows handles all the pacing automatically.
+    // Record the exact time we released the frame down the pipeline
+    g_LastReleaseTime = GetTimeMs();
+
     return oPresent(pSC, SyncInterval, Flags);
 }
 
@@ -93,6 +138,8 @@ static DWORD WINAPI InitThread(LPVOID) {
     }
     Sleep(500);
 
+    Logf("Game window found. Spawning dummy swapchain to hook Present.");
+
     WNDCLASSEXA wc = { sizeof(wc), CS_OWNDC, DefWindowProcA, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, "DummyWindow", nullptr };
     RegisterClassExA(&wc);
     HWND dummyWnd = CreateWindowA("DummyWindow", "Dummy", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
@@ -106,6 +153,9 @@ static DWORD WINAPI InitThread(LPVOID) {
         void** vtable = *(void***)pDummySC;
         WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent);
         pDummySC->Release(); pDummyDev->Release();
+        Log("Hook installed successfully. Waiting for game to call Present.");
+    } else {
+        Log("ERROR: Failed to create dummy swapchain to steal vtable.");
     }
 
     DestroyWindow(dummyWnd); UnregisterClassA("DummyWindow", wc.hInstance);
@@ -115,14 +165,27 @@ static DWORD WINAPI InitThread(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        
+        // Setup Crash Handler & Thread Safety
+        SetUnhandledExceptionFilter(CrashHandler);
+        InitializeCriticalSection(&g_logCS);
+        g_logCSInit = true;
+
         char dllPath[MAX_PATH] = {}; GetModuleFileNameA(hModule, dllPath, sizeof(dllPath));
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) {
             *(lastSlash + 1) = '\0';
             snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath);
         }
-        Log("DLL Booted - v33 The Queue Restrictor");
+        
+        // Delete old log to keep it clean for this run
+        remove(g_logPath);
+
+        Log("DLL Booted - v34 Verbose Telemetry & 5.5ms Enforcer");
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
+    }
+    else if (reason == DLL_PROCESS_DETACH) {
+        if (g_logCSInit) DeleteCriticalSection(&g_logCS);
     }
     return TRUE;
 }
