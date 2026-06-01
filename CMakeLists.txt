@@ -21,6 +21,7 @@ target_link_libraries(AutoPacer PRIVATE
     d3d11.lib
     dxguid.lib
     user32.lib
+    dwmapi.lib
 )
 
 target_link_options(AutoPacer PRIVATE /LTCG)
