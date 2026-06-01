@@ -1,24 +1,30 @@
-// AutoPacer v42 - The Flip-Sequential Restorer (Build Fixed)
+// AutoPacer v43 - The Smart Water-Valve Container
 //
-// Forces DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL instead of FLIP_DISCARD.
-// This physically prevents the Intel iGPU from throwing PCIe-bunched frames 
-// into the trash (the 0.000ms gaps), preserving the unbroken Frame Gen 
-// optical flow sequence without the need for CPU timers.
+// 1. Prevents "Buffer Overwrites" (UI flashing/duplicates) by strictly limiting 
+//    the container size to (BufferCount - 2). If full, it safely blocks the Mod.
+// 2. Uses a dynamic "Water Valve" algorithm. Instead of calculating CPU math, 
+//    the delivery thread speeds up or slows down based entirely on how full 
+//    the container is, effortlessly locking onto the Mod's true framerate.
+// 3. Clamps delivery speed to 160 FPS max, keeping the Intel display comfortably 
+//    inside the 165Hz VRR window.
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
-#include <dxgi1_6.h>
 #include <d3d11.h>
 #include <stdio.h>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 
 static char g_logPath[MAX_PATH] = "AutoPacer.log";
-static bool g_FirstFrame = true;
 
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v42] %s\n", msg);
+        fprintf(fp, "[AutoPacer v43] %s\n", msg);
         fclose(fp);
     }
 }
@@ -37,88 +43,130 @@ static bool WritePtr(void** addr, void* newVal, void** oldVal) {
     return true;
 }
 
-// ── Function Pointers ─────────────────────────────────────────────────────────
-typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateSC)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
-typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateSCForHwnd)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
-
-static PFN_CreateSC oCreateSC = nullptr;
-static PFN_CreateSCForHwnd oCreateSCForHwnd = nullptr;
 static PFN_Present oPresent = nullptr;
-
 static const int SLOT_Present = 8;
-static const int SLOT_CreateSwapChain = 10;
-static const int SLOT_CreateSwapChainForHwnd = 15;
 
-// ── Hooked CreateSwapChain ────────────────────────────────────────────────────
-static HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(
-    IDXGIFactory* pFactory, IUnknown* pDevice, 
-    DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSC)
-{
-    if (!pDesc) return oCreateSC(pFactory, pDevice, pDesc, ppSC);
+// ── The Smart Container ───────────────────────────────────────────────────────
+struct PresentArgs {
+    IDXGISwapChain* pSC;
+    UINT SyncInterval;
+    UINT Flags;
+};
 
-    DXGI_SWAP_CHAIN_DESC newDesc = *pDesc;
+static std::queue<PresentArgs> g_Queue;
+static std::mutex g_Mutex;
+static std::condition_variable g_CV_Produce;
+static std::condition_variable g_CV_Consume;
 
-    if (newDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD) {
-        Log("Intercepted CreateSwapChain! Changing SwapEffect to FLIP_SEQUENTIAL.");
-        newDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-        Beep(800, 150);
-    }
+static LARGE_INTEGER g_qpcFreq;
+static double g_LastReleaseTime = 0.0;
+static double g_TargetGapMs = 6.94; // Start at ~144 FPS pacing
 
-    return oCreateSC(pFactory, pDevice, &newDesc, ppSC);
+static UINT g_SwapchainBuffers = 6; // Default safe assumption
+static bool g_FirstFrame = true;
+
+static double GetTimeMs() {
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    return (double)(qpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
 }
 
-static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
-    IDXGIFactory2* pFactory, IUnknown* pDevice, HWND hWnd,
-    const DXGI_SWAP_CHAIN_DESC1* pDesc,
-    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFSD,
-    IDXGIOutput* pOutput, IDXGISwapChain1** ppSC)
-{
-    if (!pDesc) return oCreateSCForHwnd(pFactory, pDevice, hWnd, pDesc, pFSD, pOutput, ppSC);
-
-    DXGI_SWAP_CHAIN_DESC1 newDesc = *pDesc;
-
-    if (newDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD) {
-        Log("Intercepted CreateSwapChainForHwnd! Changing SwapEffect to FLIP_SEQUENTIAL.");
-        newDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-        Beep(800, 150);
-    }
-
-    return oCreateSCForHwnd(pFactory, pDevice, hWnd, &newDesc, pFSD, pOutput, ppSC);
-}
-
-// ── Hooked Present (Just for Verification) ────────────────────────────────────
+// ── Hooked Present (The Mod's Thread) ─────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
     if (g_FirstFrame) {
         g_FirstFrame = false;
-        
         DXGI_SWAP_CHAIN_DESC desc = {};
         if (SUCCEEDED(pSC->GetDesc(&desc))) {
-            Log("=================================================");
-            Log("FIRST PRESENT VERIFICATION:");
-            Logf("Actual SwapEffect Running: %d (3 = FLIP_SEQUENTIAL, 4 = FLIP_DISCARD)", desc.SwapEffect);
-            Log("=================================================");
+            g_SwapchainBuffers = desc.BufferCount;
+            Logf("First Frame: Detected %u Swapchain Buffers.", g_SwapchainBuffers);
         }
-        Beep(1200, 200);
+        Beep(1000, 150);
     }
 
-    return oPresent(pSC, SyncInterval, Flags);
+    // Maximum safe container capacity to prevent Buffer Overwrites
+    size_t maxSafeQueueSize = (g_SwapchainBuffers > 2) ? (g_SwapchainBuffers - 2) : 1;
+
+    {
+        std::unique_lock<std::mutex> lock(g_Mutex);
+        
+        // If the container reaches the max safe size, pause the Mod briefly.
+        // This provides perfect backpressure without breaking Frame Gen.
+        g_CV_Produce.wait(lock, [&] { return g_Queue.size() < maxSafeQueueSize; });
+        
+        g_Queue.push({ pSC, SyncInterval, Flags });
+    }
+    
+    // Notify the background delivery thread
+    g_CV_Consume.notify_one();
+    
+    return S_OK; 
+}
+
+// ── Background Pacer Thread (The Intel Delivery) ──────────────────────────────
+static DWORD WINAPI PacerThread(LPVOID) {
+    Log("Smart Water-Valve Container Thread started.");
+    int logCounter = 0;
+    
+    while (true) {
+        PresentArgs args;
+        size_t currentQueueSize = 0;
+        
+        // 1. Grab a frame from the container
+        {
+            std::unique_lock<std::mutex> lock(g_Mutex);
+            g_CV_Consume.wait(lock, [] { return !g_Queue.empty(); });
+            args = g_Queue.front();
+            g_Queue.pop();
+            currentQueueSize = g_Queue.size();
+        }
+        
+        // Free up space for the Mod
+        g_CV_Produce.notify_one();
+
+        // 2. The "Water Valve" Pacing Algorithm
+        // Target Queue Size = 1.
+        if (currentQueueSize > 1) {
+            g_TargetGapMs -= 0.1; // Queue is filling up -> Speed up delivery
+        } else if (currentQueueSize == 0) {
+            g_TargetGapMs += 0.1; // Queue is empty -> Slow down delivery
+        }
+
+        // 3. Strict VRR Clamps
+        if (g_TargetGapMs < 6.25) g_TargetGapMs = 6.25; // MAX 160 FPS (Keeps it safely under 165Hz limit)
+        if (g_TargetGapMs > 33.3) g_TargetGapMs = 33.3; // MIN 30 FPS
+
+        // 4. Smooth Delivery (The Tollbooth)
+        if (g_LastReleaseTime > 0.0) {
+            double targetTime = g_LastReleaseTime + g_TargetGapMs;
+            double now = GetTimeMs();
+            
+            // Anti-Starvation check for loading screens/menus
+            if (now > targetTime + 20.0) targetTime = now;
+            
+            while (GetTimeMs() < targetTime) {
+                YieldProcessor(); // Absolute microsecond precision
+            }
+        }
+        
+        // 5. Present to the Intel Hardware
+        g_LastReleaseTime = GetTimeMs();
+        oPresent(args.pSC, args.SyncInterval, args.Flags);
+
+        // 6. Diagnostics
+        logCounter++;
+        if (logCounter % 600 == 0) {
+            Logf("Valve Status -> Speed: %.1f FPS (Gap: %.3f ms) | Queue Level: %zu", 
+                 1000.0 / g_TargetGapMs, g_TargetGapMs, currentQueueSize);
+        }
+    }
+    return 0;
 }
 
 // ── Init Thread ───────────────────────────────────────────────────────────────
 static DWORD WINAPI InitThread(LPVOID) {
     for (int i = 0; i < 200; ++i) { if (GetModuleHandleA("dxgi.dll")) break; Sleep(50); }
-    
-    IDXGIFactory2* pFactory = nullptr;
-    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory2), (void**)&pFactory))) {
-        void** vtable = *(void***)pFactory;
-        WritePtr(&vtable[SLOT_CreateSwapChain], (void*)HookedCreateSwapChain, (void**)&oCreateSC);
-        WritePtr(&vtable[SLOT_CreateSwapChainForHwnd], (void*)HookedCreateSwapChainForHwnd, (void**)&oCreateSCForHwnd);
-        pFactory->Release();
-        Log("Factory hooks installed.");
-    }
-
     HWND gameWnd = nullptr;
     for (int i = 0; i < 600; ++i) {
         Sleep(50);
@@ -134,6 +182,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     WNDCLASSEXA wc = { sizeof(wc), CS_OWNDC, DefWindowProcA, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, "DummyWindow", nullptr };
     RegisterClassExA(&wc);
     HWND dummyWnd = CreateWindowA("DummyWindow", "Dummy", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
+
     DXGI_SWAP_CHAIN_DESC sd = {};
     sd.BufferCount = 1; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = dummyWnd; sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
@@ -143,21 +192,24 @@ static DWORD WINAPI InitThread(LPVOID) {
         void** vtable = *(void***)pDummySC;
         WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent);
         pDummySC->Release(); pDummyDev->Release();
+        Log("Smart Container Hooks installed successfully.");
     }
     DestroyWindow(dummyWnd); UnregisterClassA("DummyWindow", wc.hInstance);
-
-    Log("Waiting for Mod to create Swapchain...");
     return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        QueryPerformanceFrequency(&g_qpcFreq);
+        
         char dllPath[MAX_PATH] = {}; GetModuleFileNameA(hModule, dllPath, sizeof(dllPath));
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) { *(lastSlash + 1) = '\0'; snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath); }
         remove(g_logPath);
-        Log("DLL Booted - v42 The Flip-Sequential Restorer");
+        Log("DLL Booted - v43 The Smart Container");
+        
+        CreateThread(nullptr, 0, PacerThread, nullptr, 0, nullptr);
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
     }
     return TRUE;
