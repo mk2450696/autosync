@@ -439,7 +439,7 @@ static void PatchAllModules()
     HANDLE proc = GetCurrentProcess();
     if (!EnumProcessModules(proc, mods, sizeof(mods), &needed)) return;
 
-    DWORD count = min(needed / sizeof(HMODULE), 256u);
+    DWORD count = (needed / sizeof(HMODULE) < 256u) ? needed / sizeof(HMODULE) : 256u;
 
     // Get the real function pointers from dxgi.dll first
     HMODULE dxgi = GetModuleHandleA("dxgi.dll");
