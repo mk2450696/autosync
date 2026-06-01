@@ -1,20 +1,15 @@
-// AutoPacer v42 - The Flip-Sequential Restorer
+// AutoPacer v42 - The Flip-Sequential Restorer (Build Fixed)
 //
-// Abandons broken async pacing which caused buffer-overwrite artifacts.
-// The true cause of CASO Frame Gen judder is the Mod using FLIP_DISCARD. 
-// When PCIe micro-bursts occur, FLIP_DISCARD tells Windows to throw the 
-// first frame in the trash (0.000ms gap), destroying the Frame Gen optical 
-// flow sequence.
-// By forcing DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, Windows is forced to display 
-// every single frame without dropping them, natively restoring the smooth 
-// visual sequence without needing any software CPU timers.
+// Forces DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL instead of FLIP_DISCARD.
+// This physically prevents the Intel iGPU from throwing PCIe-bunched frames 
+// into the trash (the 0.000ms gaps), preserving the unbroken Frame Gen 
+// optical flow sequence without the need for CPU timers.
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
 #include <windows.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_6.h>
+#include <d3d11.h>
 #include <stdio.h>
 
 static char g_logPath[MAX_PATH] = "AutoPacer.log";
@@ -64,8 +59,6 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(
 
     DXGI_SWAP_CHAIN_DESC newDesc = *pDesc;
 
-    // If the Mod uses FLIP_DISCARD (4), force it to FLIP_SEQUENTIAL (3).
-    // We leave the BufferCount (6) and Flags (0x842) completely intact so it doesn't crash.
     if (newDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD) {
         Log("Intercepted CreateSwapChain! Changing SwapEffect to FLIP_SEQUENTIAL.");
         newDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
@@ -117,7 +110,6 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
 static DWORD WINAPI InitThread(LPVOID) {
     for (int i = 0; i < 200; ++i) { if (GetModuleHandleA("dxgi.dll")) break; Sleep(50); }
     
-    // Hook Factory
     IDXGIFactory2* pFactory = nullptr;
     if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory2), (void**)&pFactory))) {
         void** vtable = *(void***)pFactory;
@@ -127,7 +119,6 @@ static DWORD WINAPI InitThread(LPVOID) {
         Log("Factory hooks installed.");
     }
 
-    // Wait for game window
     HWND gameWnd = nullptr;
     for (int i = 0; i < 600; ++i) {
         Sleep(50);
@@ -140,7 +131,6 @@ static DWORD WINAPI InitThread(LPVOID) {
     }
     Sleep(500);
 
-    // Hook Present
     WNDCLASSEXA wc = { sizeof(wc), CS_OWNDC, DefWindowProcA, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, "DummyWindow", nullptr };
     RegisterClassExA(&wc);
     HWND dummyWnd = CreateWindowA("DummyWindow", "Dummy", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
