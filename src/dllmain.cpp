@@ -6,8 +6,6 @@
 // This feeds a smooth, evenly-paced stream of frames to the Intel iGPU, allowing
 // VRR to function flawlessly at any framerate.
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
 #include <windows.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
@@ -59,8 +57,8 @@ static double GetTimeMs()
     return (double)(qpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
 }
 
-// WinMM timer resolution
-typedef MMRESULT(WINAPI* timeBeginPeriod_t)(UINT uPeriod);
+// WinMM timer resolution (using UINT instead of MMRESULT to avoid mmsystem.h dependency)
+typedef UINT (WINAPI* timeBeginPeriod_t)(UINT uPeriod);
 
 // ── VTable helpers ────────────────────────────────────────────────────────────
 static bool WritePtr(void** addr, void* newVal, void** oldVal)
