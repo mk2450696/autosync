@@ -1,15 +1,15 @@
-// AutoPacer v26 - The Answer Reader (Queue Saturation Telemetry)
+// AutoPacer v27 - Hotkey Triggered Answer Reader
 //
-// Injects the DXGI_PRESENT_TEST (0x1) and records the exact HRESULT (the answer) 
-// the Intel driver gives us, along with the VBlank monitor timings. 
-// This will prove if the Intel queue is returning DXGI_ERROR_WAS_STILL_DRAWING 
-// (queue full) right before the mod forces the frame and causes a stutter.
+// Waits in the background until the user presses F8. 
+// Once F8 is pressed, it records 600 frames of actual in-game telemetry,
+// tracking the DXGI_PRESENT_TEST (0x1) HRESULT and Monitor VBlank timings.
 
 #include <windows.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <d3d11.h>
 #include <stdio.h>
+#include <atomic>
 
 static char g_csvPath[MAX_PATH] = "AutoPacer_AnswerStats.csv";
 static char g_logPath[MAX_PATH] = "AutoPacer.log";
@@ -17,12 +17,15 @@ static char g_logPath[MAX_PATH] = "AutoPacer.log";
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v26] %s\n", msg);
+        fprintf(fp, "[AutoPacer v27] %s\n", msg);
         fclose(fp);
     }
 }
 
 // ── Telemetry State ───────────────────────────────────────────────────────────
+enum TestState { WAITING = 0, RECORDING = 1, DONE = 2 };
+static std::atomic<int> g_State{ WAITING };
+
 struct FrameRecord {
     int frameNum;
     void* swapchainPtr;
@@ -37,9 +40,7 @@ struct FrameRecord {
 const int MAX_FRAMES = 600;
 static FrameRecord g_Records[MAX_FRAMES];
 static int g_FrameCount = 0;
-static bool g_TelemetryDone = false;
 
-static bool g_FirstFrame = true;
 static LARGE_INTEGER g_qpcFreq;
 static double g_LastCpuTime = 0.0;
 static double g_LastDispTime = 0.0;
@@ -64,28 +65,36 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── Hooked Present (The Answer Reader) ────────────────────────────────────────
+// ── Hooked Present (Hotkey Triggered) ─────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
-    if (g_FirstFrame) {
-        QueryPerformanceFrequency(&g_qpcFreq);
-        g_LastCpuTime = GetTimeMs();
-        g_FirstFrame = false;
-        Log("Telemetry Started. Tracking Test Results and Hardware Queue.");
-        Beep(1000, 100);
+    int currentState = g_State.load();
+
+    // 1. Waiting for Hotkey
+    if (currentState == WAITING) {
+        // If F8 is pressed, transition to RECORDING
+        if (GetAsyncKeyState(VK_F8) & 0x8000) {
+            g_State.store(RECORDING);
+            QueryPerformanceFrequency(&g_qpcFreq);
+            g_LastCpuTime = GetTimeMs();
+            Log("F8 Pressed. Telemetry Started.");
+            Beep(1000, 150); // First Beep
+        }
+        return oPresent(pSC, SyncInterval, Flags);
     }
 
-    if (!g_TelemetryDone) {
+    // 2. Currently Recording
+    if (currentState == RECORDING) {
         double now = GetTimeMs();
         double cpuGap = now - g_LastCpuTime;
         g_LastCpuTime = now;
 
-        // 1. Inject the Hardware Probe (0x1) and record the driver's answer
+        // Inject the Hardware Probe (0x1) and record the driver's answer
         double testStart = GetTimeMs();
         HRESULT testHr = oPresent(pSC, 0, DXGI_PRESENT_TEST);
         double testDuration = GetTimeMs() - testStart;
 
-        // 2. Read the Monitor's actual VBlank hardware timings
+        // Read the Monitor's actual VBlank hardware timings
         DXGI_FRAME_STATISTICS stats = {};
         double dispGap = 0.0;
         if (SUCCEEDED(pSC->GetFrameStatistics(&stats))) {
@@ -94,7 +103,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
             if (stats.SyncQPCTime.QuadPart > 0) g_LastDispTime = dispTimeMs;
         }
 
-        // 3. Do the actual render request that the Mod asked for
+        // Do the actual render request
         double renderStart = GetTimeMs();
         HRESULT renderHr = oPresent(pSC, SyncInterval, Flags);
         double renderDuration = GetTimeMs() - renderStart;
@@ -104,8 +113,11 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
             g_Records[g_FrameCount] = { g_FrameCount, pSC, cpuGap, testHr, testDuration, renderHr, renderDuration, dispGap };
             g_FrameCount++;
         } 
-        else {
-            g_TelemetryDone = true;
+        
+        // Check if we just hit the limit
+        if (g_FrameCount >= MAX_FRAMES) {
+            g_State.store(DONE);
+            
             FILE* fp;
             if (fopen_s(&fp, g_csvPath, "w") == 0) {
                 fprintf(fp, "Frame,Swapchain,CpuGapMs,Test_HRESULT,Test_DurationMs,Render_HRESULT,Render_DurationMs,DispVBlankGapMs\n");
@@ -119,11 +131,12 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInt
                 fclose(fp);
             }
             Log("Telemetry complete. CSV written.");
-            Beep(1500, 200); // The second beep is back!
+            Beep(1500, 200); // Second Beep
         }
         return renderHr;
     }
 
+    // 3. Telemetry Done
     return oPresent(pSC, SyncInterval, Flags);
 }
 
