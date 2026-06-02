@@ -1,15 +1,11 @@
-// AutoPacer v44 - The Dynamic Ring-Safe Container
+// AutoPacer - 120 FPS Static Test Container
 //
-// Explains the v38 144FPS success: At matching speeds, the Mod never lapped the Pacer.
-// When speeds drifted, the Mod wrapped around the 6-buffer DXGI ring and overwrote 
-// frames before they were presented, destroying the FG sequence and flashing the UI.
-//
-// FIX: 
-// 1. A strict Queue Size limit of 4 safely backpressures the Mod, mathematically
-//    preventing DXGI wrap-around overwrites and preserving the FG sequence.
-// 2. A 16-frame Rolling Average completely absorbs the FG micro-bursts, finding the
-//    true FPS and dynamically pacing the Intel display to un-bunch the PCIe traffic.
+// Hardcoded to exactly 120 FPS (8.333ms gap). 
+// Queue limit set to 4 to prevent buffer-overwrite (flashing/artifacts).
+// USER MUST CAP GAME/MOD TO 120 FPS FOR THIS TO FLOW PERFECTLY.
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
@@ -18,20 +14,15 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
-#include <atomic>
 
 static char g_logPath[MAX_PATH] = "AutoPacer.log";
 
 static void Log(const char* msg) {
     FILE* fp;
     if (fopen_s(&fp, g_logPath, "a") == 0) {
-        fprintf(fp, "[AutoPacer v44] %s\n", msg);
+        fprintf(fp, "[AutoPacer 120-Test] %s\n", msg);
         fclose(fp);
     }
-}
-static void Logf(const char* fmt, ...) {
-    char buf[512]; va_list a; va_start(a, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, a); va_end(a); Log(buf);
 }
 
 // ── VTable helpers ────────────────────────────────────────────────────────────
@@ -48,7 +39,7 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present oPresent = nullptr;
 static const int SLOT_Present = 8;
 
-// ── The Container State ───────────────────────────────────────────────────────
+// ── The Container ─────────────────────────────────────────────────────────────
 struct PresentArgs {
     IDXGISwapChain* pSC;
     UINT SyncInterval;
@@ -61,14 +52,8 @@ static std::condition_variable g_CV_Produce;
 static std::condition_variable g_CV_Consume;
 
 static LARGE_INTEGER g_qpcFreq;
-static double g_LastProduceTime = 0.0;
 static double g_LastReleaseTime = 0.0;
-
-// Dynamic Pacing Variables
-const int HISTORY_SIZE = 16; // 16 frames is enough to average out the FG bursts
-static double g_History[HISTORY_SIZE];
-static int g_HistoryIdx = 0;
-static std::atomic<double> g_DynamicGapMs{ 16.666 }; // Default 60fps start
+const double TARGET_GAP_MS = 8.3333; // EXACTLY 120 FPS
 
 static double GetTimeMs() {
     LARGE_INTEGER qpc;
@@ -79,51 +64,24 @@ static double GetTimeMs() {
 // ── Hooked Present (The Producer) ─────────────────────────────────────────────
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pSC, UINT SyncInterval, UINT Flags)
 {
-    double now = GetTimeMs();
+    std::unique_lock<std::mutex> lock(g_Mutex);
     
-    // 1. Calculate True Framerate
-    if (g_LastProduceTime > 0.0) {
-        double gap = now - g_LastProduceTime;
-        // Ignore load screens and heavy lag spikes in the math
-        if (gap > 1.0 && gap < 50.0) {
-            g_History[g_HistoryIdx] = gap;
-            g_HistoryIdx = (g_HistoryIdx + 1) % HISTORY_SIZE;
-            
-            double sum = 0.0;
-            for(int i = 0; i < HISTORY_SIZE; i++) sum += g_History[i];
-            
-            g_DynamicGapMs.store(sum / (double)HISTORY_SIZE);
-        }
-    }
-    g_LastProduceTime = now;
-
-    // 2. Put Frame in Container (The Ring-Buffer Lock)
-    {
-        std::unique_lock<std::mutex> lock(g_Mutex);
-        
-        // Mathematical Protection: The Mod uses 6 buffers.
-        // We stop accepting frames at 4. This guarantees the Mod is paused BEFORE 
-        // it can wrap around the ring and overwrite the frame we are currently holding.
-        g_CV_Produce.wait(lock, [] { return g_Queue.size() < 4; });
-        
-        g_Queue.push({ pSC, SyncInterval, Flags });
-    }
+    // Prevent Mod from wrapping around the 6-buffer ring and causing flashing
+    g_CV_Produce.wait(lock, [] { return g_Queue.size() < 4; });
     
+    g_Queue.push({ pSC, SyncInterval, Flags });
     g_CV_Consume.notify_one();
     
-    // Return instantly so the Mod's Frame Gen sequence continues flawlessly.
     return S_OK; 
 }
 
 // ── Background Pacer Thread (The Consumer) ────────────────────────────────────
 static DWORD WINAPI PacerThread(LPVOID) {
-    Log("Dynamic Ring-Safe Container Thread started.");
-    int logCounter = 0;
+    Log("120 FPS Asynchronous Container Thread started.");
     
     while (true) {
         PresentArgs args;
         
-        // 1. Get Frame from Container
         {
             std::unique_lock<std::mutex> lock(g_Mutex);
             g_CV_Consume.wait(lock, [] { return !g_Queue.empty(); });
@@ -131,39 +89,18 @@ static DWORD WINAPI PacerThread(LPVOID) {
             g_Queue.pop();
         }
         
-        // Notify the Mod that there is space in the queue
         g_CV_Produce.notify_one();
 
-        // 2. Get the Dynamic Target and Clamp it for VRR
-        double targetGapMs = g_DynamicGapMs.load();
-        if (targetGapMs < 6.25) targetGapMs = 6.25; // MAX = 160 FPS (Safe limit for 165Hz VRR)
-        if (targetGapMs > 33.3) targetGapMs = 33.3; // MIN = 30 FPS
-
-        // 3. Perfect Hardware Delivery Timing
+        // Perfect 120 FPS pacing
         if (g_LastReleaseTime > 0.0) {
-            double targetTime = g_LastReleaseTime + targetGapMs;
-            double now = GetTimeMs();
-            
-            // Anti-Starvation: Don't rapidly speed up if the game paused
-            if (now > targetTime + targetGapMs) {
-                targetTime = now;
-            }
-            
+            double targetTime = g_LastReleaseTime + TARGET_GAP_MS;
             while (GetTimeMs() < targetTime) {
-                YieldProcessor(); // Ultra-precise micro-spin
+                YieldProcessor(); 
             }
         }
         
-        // 4. Deliver to Intel Driver
         g_LastReleaseTime = GetTimeMs();
         oPresent(args.pSC, args.SyncInterval, args.Flags);
-
-        // 5. Periodic Logging (Every 600 frames = ~5 seconds)
-        logCounter++;
-        if (logCounter % 600 == 0) {
-            Logf("Dynamic Pacer -> Game Average FPS: %.1f | Delivering at: %.1f FPS | Gap: %.3f ms | Queue: %zu", 
-                 1000.0 / g_DynamicGapMs.load(), 1000.0 / targetGapMs, targetGapMs, g_Queue.size());
-        }
     }
     return 0;
 }
@@ -196,8 +133,7 @@ static DWORD WINAPI InitThread(LPVOID) {
         void** vtable = *(void***)pDummySC;
         WritePtr(&vtable[SLOT_Present], (void*)HookedPresent, (void**)&oPresent);
         pDummySC->Release(); pDummyDev->Release();
-        Log("Dynamic Container Hooks installed successfully.");
-        Beep(1000, 150);
+        Log("Container Hooks installed successfully.");
     }
     DestroyWindow(dummyWnd); UnregisterClassA("DummyWindow", wc.hInstance);
     return 0;
@@ -207,15 +143,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         QueryPerformanceFrequency(&g_qpcFreq);
-        
-        // Pre-fill rolling average to a safe 60 FPS
-        for (int i = 0; i < HISTORY_SIZE; i++) g_History[i] = 16.666;
-
         char dllPath[MAX_PATH] = {}; GetModuleFileNameA(hModule, dllPath, sizeof(dllPath));
         char* lastSlash = strrchr(dllPath, '\\');
         if (lastSlash) { *(lastSlash + 1) = '\0'; snprintf(g_logPath, sizeof(g_logPath), "%sAutoPacer.log", dllPath); }
         remove(g_logPath);
-        Log("DLL Booted - v44 The Dynamic Ring-Safe Container");
+        Log("DLL Booted - 120 FPS Static Test");
         
         CreateThread(nullptr, 0, PacerThread, nullptr, 0, nullptr);
         CreateThread(nullptr, 0, InitThread, hModule, 0, nullptr);
